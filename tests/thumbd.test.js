@@ -35,17 +35,17 @@ before(async () => {
   await sharp({ create: { width: 64, height: 48, channels: 3, background: { r: 200, g: 30, b: 30 } } })
     .png().toFile(testImage);
 
-  // Generate a test video — 1s red frame, H.264 (software decode, runs everywhere)
+  // Generate a test video — 12s color bars, H.264 (software decode, runs everywhere)
   testVideo = path.join(ROOT, 'test.mp4');
   await new Promise((resolve, reject) => {
     const { execFile } = require('node:child_process');
     execFile('ffmpeg', [
       '-y', '-hide_banner', '-loglevel', 'error',
-      '-f', 'lavfi', '-i', 'color=c=red:s=64x48:d=1',
+      '-f', 'lavfi', '-i', 'testsrc2=s=64x48:d=12:r=10',
       '-f', 'lavfi', '-i', 'anullsrc=r=44100:cl=stereo',
-      '-t', '1', '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-c:a', 'aac',
+      '-t', '12', '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-c:a', 'aac',
       testVideo,
-    ], { timeout: 60000 }, (err) => err ? reject(err) : resolve());
+    ], { timeout: 90000 }, (err) => err ? reject(err) : resolve());
   });
 
   // Start the server (port 0 = ephemeral)
@@ -241,6 +241,46 @@ test('GET /thumb video (H.264) -> 200 WebP', async () => {
   assert.equal(r.status, 200, r.body.toString().slice(0, 200));
   assert.equal(r.headers['content-type'], 'image/webp');
   assert.equal(r.body.subarray(0, 4).toString(), 'RIFF');
+});
+
+test('GET /thumb video mode=preview -> animated WebP', async () => {
+  const r = await get(`/thumb?path=${encodeURIComponent('test.mp4')}&w=100&h=100&mode=preview&t=0&d=2&fps=5`, { 'X-Thumb-Token': 'testtoken123' });
+  assert.equal(r.status, 200, r.body.toString().slice(0, 200));
+  assert.equal(r.headers['content-type'], 'image/webp');
+  assert.equal(r.body.subarray(0, 4).toString(), 'RIFF');
+  // animated webp: VP8X chunk present (animation flag) or multiple frames
+  const meta = await sharp(r.body).metadata();
+  assert.ok(meta.pages > 1, `expected animated webp (pages>1), got pages=${meta.pages}`);
+});
+
+test('GET /thumb video mode=slideshow count=3 -> animated WebP', async () => {
+  const r = await get(`/thumb?path=${encodeURIComponent('test.mp4')}&w=100&h=100&mode=slideshow&count=3`, { 'X-Thumb-Token': 'testtoken123' });
+  assert.equal(r.status, 200, r.body.toString().slice(0, 200));
+  assert.equal(r.headers['content-type'], 'image/webp');
+  const meta = await sharp(r.body).metadata();
+  assert.ok(meta.pages > 1, `expected animated webp, got pages=${meta.pages}`);
+});
+
+test('GET /thumb video mode=slideshow interval=4 -> animated WebP', async () => {
+  const r = await get(`/thumb?path=${encodeURIComponent('test.mp4')}&w=100&h=100&mode=slideshow&interval=4`, { 'X-Thumb-Token': 'testtoken123' });
+  assert.equal(r.status, 200, r.body.toString().slice(0, 200));
+  assert.equal(r.headers['content-type'], 'image/webp');
+  const meta = await sharp(r.body).metadata();
+  assert.ok(meta.pages > 1, `expected animated webp, got pages=${meta.pages}`);
+});
+
+test('GET /thumb video modes have separate cache entries', async () => {
+  const p = (extra) => `/thumb?path=${encodeURIComponent('test.mp4')}&w=60&h=60${extra}`;
+  const r1 = await get(p(''), { 'X-Thumb-Token': 'testtoken123' });                                  // still
+  const r2 = await get(p('&mode=preview&t=0&d=1&fps=2'), { 'X-Thumb-Token': 'testtoken123' });       // preview
+  const r3 = await get(p('&mode=slideshow&count=2'), { 'X-Thumb-Token': 'testtoken123' });          // slideshow
+  assert.equal(r1.status, 200);
+  assert.equal(r2.status, 200);
+  assert.equal(r3.status, 200);
+  // all three should be generated (different cache keys)
+  assert.equal(r1.headers['x-thumb-source'], 'generated');
+  assert.equal(r2.headers['x-thumb-source'], 'generated');
+  assert.equal(r3.headers['x-thumb-source'], 'generated');
 });
 
 // ---------- Integration: unsupported ----------

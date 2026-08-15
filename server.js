@@ -120,6 +120,84 @@ async function makeVideoThumb(realPath, w, h, t, outTmp, decoder, fit = 'contain
   });
 }
 
+// Animated preview: `mode=preview` — animated WebP from `t` for `d` seconds at `fps`
+// (matches the legacy AnimatedVideoThumbnail: -ss 1 -t 3 -vf fps=10 -loop 0)
+async function makeVideoPreview(realPath, w, h, t, d, fps, outTmp, decoder, fit = 'contain') {
+  const decArgs = decoder ? ['-c:v', decoder] : [];
+  const vf = fit === 'cover'
+    ? `fps=${fps},scale=${w}:${h}:force_original_aspect_ratio=increase,crop=${w}:${h}`
+    : `fps=${fps},scale=${w}:${h}:force_original_aspect_ratio=decrease`;
+  await new Promise((resolve, reject) => {
+    execFile(FFMPEG, [
+      '-y', '-hide_banner', '-loglevel', 'error',
+      '-ss', String(Math.max(0, t)),
+      ...decArgs,
+      '-i', realPath,
+      '-t', String(Math.max(0.2, d)),
+      '-vf', vf,
+      '-loop', '0',
+      '-q:v', '4',
+      '-f', 'webp',
+      outTmp,
+    ], { timeout: 90000 }, (err) => err ? reject(err) : resolve());
+  });
+}
+
+// Extract a single still frame to a file (helper for slideshow)
+async function extractVideoFrame(realPath, ts, w, h, outFile, decoder, fit = 'contain') {
+  const decArgs = decoder ? ['-c:v', decoder] : [];
+  const vf = fit === 'cover'
+    ? `scale=${w}:${h}:force_original_aspect_ratio=increase,crop=${w}:${h}`
+    : `scale=${w}:${h}:force_original_aspect_ratio=decrease`;
+  await new Promise((resolve, reject) => {
+    execFile(FFMPEG, [
+      '-y', '-hide_banner', '-loglevel', 'error',
+      '-ss', String(Math.max(0, ts)),
+      ...decArgs,
+      '-i', realPath,
+      '-frames:v', '1',
+      '-vf', vf,
+      '-q:v', '4',
+      '-f', 'webp',
+      outFile,
+    ], { timeout: 60000 }, (err) => err ? reject(err) : resolve());
+  });
+}
+
+// Slideshow: `mode=slideshow` — animated WebP with N frames. Either `interval`
+// (one frame every N seconds) or `count` (N frames evenly spaced over the video).
+// Each frame is shown for 1 second.
+async function makeVideoSlideshow(realPath, w, h, times, outTmp, decoder, fit = 'contain') {
+  const frames = [];
+  try {
+    for (let i = 0; i < times.length; i++) {
+      const f = `${outTmp}.f${i}`;
+      await extractVideoFrame(realPath, times[i], w, h, f, decoder, fit);
+      frames.push(f);
+    }
+    // Concatenate the stills into an animated WebP (each shown 1s)
+    const inputs = [];
+    const filterParts = [];
+    frames.forEach((f, i) => {
+      inputs.push('-loop', '1', '-t', '1', '-i', f);
+      filterParts.push(`[${i}:v]`);
+    });
+    await new Promise((resolve, reject) => {
+      execFile(FFMPEG, [
+        '-y', '-hide_banner', '-loglevel', 'error',
+        ...inputs,
+        '-filter_complex', `${filterParts.join('')}concat=n=${frames.length}:v=1`,
+        '-loop', '0',
+        '-q:v', '4',
+        '-f', 'webp',
+        outTmp,
+      ], { timeout: 90000 }, (err) => err ? reject(err) : resolve());
+    });
+  } finally {
+    for (const f of frames) await fsp.unlink(f).catch(() => {});
+  }
+}
+
 // ---------- Request handler ----------
 async function handle(req, res) {
   if (req.method !== 'GET') return send(res, 405, 'method not allowed (only GET)');
@@ -142,6 +220,13 @@ async function handle(req, res) {
   const t = Math.max(0, parseFloat(u.searchParams.get('t') || '1'));
   const fit = u.searchParams.get('fit') === 'cover' ? 'cover' : 'contain';  // contain (keep ratio) default, cover (fill+crop) optional
   const noCache = u.searchParams.get('nocache') === '1' || u.searchParams.get('nocache') === 'true';  // skip cache read (still writes)
+  // Video modes: still (default, single frame at t), preview (animated, t..t+d at fps),
+  // slideshow (animated, either interval=seconds or count=N evenly spaced over the video)
+  const mode = u.searchParams.get('mode') || 'still';
+  const d = Math.max(0.2, parseFloat(u.searchParams.get('d') || '3'));
+  const fps = Math.max(1, Math.min(30, parseInt(u.searchParams.get('fps') || '10', 10) || 10));
+  const count = Math.max(1, Math.min(60, parseInt(u.searchParams.get('count') || '3', 10) || 3));
+  const interval = Math.max(0, parseFloat(u.searchParams.get('interval') || '0'));
   if (!p) return send(res, 400, 'missing path');
 
   // Build absolute path (only if already absolute, otherwise relative to first root)
@@ -159,7 +244,9 @@ async function handle(req, res) {
   if (!isVideo && !isImage) return send(res, 415, 'unsupported type');
 
   // Cache (read is skipped when nocache=1, write still happens below)
-  const cp = cachePath(real, w, h, isVideo ? t : 0, fit);
+  // cache key includes the mode + mode params so still/preview/slideshow stay separate
+  const cacheVariant = isVideo ? `${mode}|${t}|${d}|${fps}|${count}|${interval}|${fit}` : fit;
+  const cp = cachePath(real, w, h, cacheVariant);
   if (!noCache) {
     try {
       const st = await fsp.stat(cp);
@@ -182,16 +269,36 @@ async function handle(req, res) {
       const info = await probeVideo(real);
       const v4l2 = await hasV4l2Decoder(V4L2).catch(() => false);
       const decoder = pickDecoder(info ? info.codec : null, v4l2);
-      // clamp seek time for long videos
       const dur = info ? info.duration : null;
+      // clamp seek time for long videos (still/preview only)
       const seek = (dur !== null && t > dur) ? Math.max(0, Math.min(VIDEO_MAX_SEC, dur / 2)) : t;
+      const generate = async (dec) => {
+        if (mode === 'preview') {
+          await makeVideoPreview(real, w, h, seek, d, fps, outTmp, dec, fit);
+        } else if (mode === 'slideshow') {
+          // build the frame timestamps: interval (every N s) or count (N evenly spaced)
+          let times;
+          if (!dur) throw new Error('slideshow needs a probeable video duration');
+          if (interval > 0) {
+            times = [];
+            for (let ts = interval; ts < dur && times.length < 60; ts += interval) times.push(ts);
+            if (!times.length) times = [Math.max(0.5, dur / 2)];
+          } else {
+            times = [];
+            for (let i = 1; i <= count; i++) times.push(dur * i / (count + 1));
+          }
+          await makeVideoSlideshow(real, w, h, times, outTmp, dec, fit);
+        } else {
+          await makeVideoThumb(real, w, h, seek, outTmp, dec, fit);
+        }
+      };
       try {
-        await makeVideoThumb(real, w, h, seek, outTmp, decoder, fit);
+        await generate(decoder);
       } catch (hwErr) {
         if (decoder) {
           // HW decode failed (e.g. codec details) → software retry
           log('hw decode failed, fallback to software:', real, hwErr.message);
-          await makeVideoThumb(real, w, h, seek, outTmp, null, fit);
+          await generate(null);
         } else throw hwErr;
       }
     } else {
@@ -229,5 +336,6 @@ if (require.main === module) {
 
 module.exports = {
   handle, main, resolveAllowed, cachePath, probeVideo, hasV4l2Decoder, pickDecoder,
-  makeImageThumb, makeVideoThumb, ROOTS, CACHE_DIR, TOKEN, PORT,
+  makeImageThumb, makeVideoThumb, makeVideoPreview, makeVideoSlideshow, extractVideoFrame,
+  ROOTS, CACHE_DIR, TOKEN, PORT,
 };

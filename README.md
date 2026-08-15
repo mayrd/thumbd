@@ -80,8 +80,13 @@ GET /health
 |---|---|
 | `path` | A file inside one of the configured roots (otherwise 403). Absolute, or relative to the first root. |
 | `w`, `h` | Target size (max 1024, no upscaling) |
-| `t` | Video timestamp in seconds (default 1; clamped for long videos) |
+| `t` | Video timestamp in seconds for `still` (default 1) and `preview` start (default 1) |
 | `fit` | `contain` (default — scale to fit the box, keep the source aspect ratio, no crop) or `cover` (fill the box exactly, cropping overflow). Passed through to sharp/ffmpeg. |
+| `mode` | Video mode: `still` (default, single frame at `t`), `preview` (animated WebP from `t` for `d` seconds at `fps`, like the legacy thumbnailer's first-seconds preview), `slideshow` (animated WebP of evenly spaced frames) |
+| `d` | `preview` duration in seconds (default 3) |
+| `fps` | `preview` animation rate (default 10, max 30) |
+| `count` | `slideshow`: number of frames, evenly spaced over the whole video (default 3, max 60) |
+| `interval` | `slideshow`: alternative to `count` — one frame every N seconds (max 60 frames) |
 | `nocache` | `1` or `true` — skip the cache *read* (always regenerate), but still write the result to the cache. Useful when debugging changes. |
 
 - Auth: header `X-Thumb-Token` (only when `THUMBD_TOKEN` is set)
