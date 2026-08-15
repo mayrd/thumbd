@@ -141,6 +141,7 @@ async function handle(req, res) {
   const h = Math.min(parseInt(u.searchParams.get('h') || '320', 10) || 320, 1024);
   const t = Math.max(0, parseFloat(u.searchParams.get('t') || '1'));
   const fit = u.searchParams.get('fit') === 'cover' ? 'cover' : 'contain';  // contain (keep ratio) default, cover (fill+crop) optional
+  const noCache = u.searchParams.get('nocache') === '1' || u.searchParams.get('nocache') === 'true';  // skip cache read (still writes)
   if (!p) return send(res, 400, 'missing path');
 
   // Build absolute path (only if already absolute, otherwise relative to first root)
@@ -157,19 +158,21 @@ async function handle(req, res) {
   const isImage = IMAGE_EXTS.has(ext);
   if (!isVideo && !isImage) return send(res, 415, 'unsupported type');
 
-  // Cache
+  // Cache (read is skipped when nocache=1, write still happens below)
   const cp = cachePath(real, w, h, isVideo ? t : 0, fit);
-  try {
-    const st = await fsp.stat(cp);
-    res.writeHead(200, {
-      'Content-Type': 'image/webp',
-      'Cache-Control': `public, max-age=${CACHE_MAX_AGE}`,
-      'ETag': `"${st.size}-${st.mtimeMs}"`,
-      'X-Thumb-Source': 'cache',
-    });
-    fs.createReadStream(cp).pipe(res);
-    return;
-  } catch { /* cache miss */ }
+  if (!noCache) {
+    try {
+      const st = await fsp.stat(cp);
+      res.writeHead(200, {
+        'Content-Type': 'image/webp',
+        'Cache-Control': `public, max-age=${CACHE_MAX_AGE}`,
+        'ETag': `"${st.size}-${st.mtimeMs}"`,
+        'X-Thumb-Source': 'cache',
+      });
+      fs.createReadStream(cp).pipe(res);
+      return;
+    } catch { /* cache miss */ }
+  }
 
   // Generate
   const outTmp = cp + '.tmp.' + process.pid;

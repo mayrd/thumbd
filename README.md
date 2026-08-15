@@ -82,6 +82,7 @@ GET /health
 | `w`, `h` | Target size (max 1024, no upscaling) |
 | `t` | Video timestamp in seconds (default 1; clamped for long videos) |
 | `fit` | `contain` (default — scale to fit the box, keep the source aspect ratio, no crop) or `cover` (fill the box exactly, cropping overflow). Passed through to sharp/ffmpeg. |
+| `nocache` | `1` or `true` — skip the cache *read* (always regenerate), but still write the result to the cache. Useful when debugging changes. |
 
 - Auth: header `X-Thumb-Token` (only when `THUMBD_TOKEN` is set)
 - Response: `image/webp`, `Cache-Control: public, max-age=604800`, `ETag`, `X-Thumb-Source: generated|cache`

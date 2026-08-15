@@ -218,6 +218,23 @@ test('GET /thumb contain and cover use separate cache entries', async () => {
   assert.equal(r3.headers['x-thumb-source'], 'cache');
 });
 
+test('GET /thumb nocache=1 skips cache read but still writes', async () => {
+  const p = `/thumb?path=${encodeURIComponent('test.png')}&w=50&h=50`;
+  // prime the cache
+  const r1 = await get(p, { 'X-Thumb-Token': 'testtoken123' });
+  assert.equal(r1.headers['x-thumb-source'], 'generated');
+  // normal second call -> cache hit
+  const r2 = await get(p, { 'X-Thumb-Token': 'testtoken123' });
+  assert.equal(r2.headers['x-thumb-source'], 'cache');
+  // nocache -> regenerated, even though cache entry exists
+  const r3 = await get(p + '&nocache=1', { 'X-Thumb-Token': 'testtoken123' });
+  assert.equal(r3.status, 200);
+  assert.equal(r3.headers['x-thumb-source'], 'generated');
+  // cache entry was refreshed, so the next normal call is a cache hit again
+  const r4 = await get(p, { 'X-Thumb-Token': 'testtoken123' });
+  assert.equal(r4.headers['x-thumb-source'], 'cache');
+});
+
 // ---------- Integration: video thumbnail ----------
 test('GET /thumb video (H.264) -> 200 WebP', async () => {
   const r = await get(`/thumb?path=${encodeURIComponent('test.mp4')}&w=100&h=100&t=0`, { 'X-Thumb-Token': 'testtoken123' });
