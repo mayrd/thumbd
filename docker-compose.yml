@@ -1,0 +1,65 @@
+# thumbd — persistenter Thumbnail-Daemon
+# Beispiel-Compose: Ordner mit Medien einfach als /data reinmappen.
+# Docker-Image lokal bauen (ARM64):  docker compose build
+# Start:                              docker compose up -d
+
+services:
+  thumbd:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: thumbd:latest
+    container_name: thumbd
+    restart: unless-stopped
+    # uid-Wechsel macht der Entrypoint (root → node uid 1000, damit das Cache-Volume
+    # gechownt werden kann). Kein user:-Override hier — der wuerde den Entrypoint als
+    # node starten und das chown schlaege fehl.
+    # group_add 44 = Host-Gruppe 'video' (v4l2-Hardware-Decoder-Zugriff)
+    group_add:
+      - "44"
+    ports:
+      - "8090:8090"          # intern nutzen (auth_request) oder nur localhost exponieren
+    environment:
+      THUMBD_PORT: "8090"
+      # Komma-getrennte Roots — alles andere wird abgelehnt (Pfad-Whitelist, symlink-sicher)
+      THUMBD_ROOTS: "/data,/mnt/pcloud,/mnt/crypt0"
+      THUMBD_CACHE: "/cache"
+      # Token fuer Request-Auth (leer = kein Auth — NUR intern hinter nginx auth_request verwenden!)
+      THUMBD_TOKEN: "${THUMBD_TOKEN:-}"
+      # Hardware-Decoder (Pi 5: h264_v4l2m2m). Fallback auf Software-Decode, falls nicht verfuegbar.
+      THUMBD_V4L2: "h264_v4l2m2m"
+    volumes:
+      # >>> HIER deinen Medien-Ordner reinmappen <<<
+      - /home/daniel:/home/daniel
+      - /mnt/pcloud:/mnt/pcloud
+      - /mnt/crypt0:/mnt/crypt0
+      - thumbd-cache:/cache
+    # Hardware-Video-Decode braucht Zugriff auf die v4l2-Geraete (Pi 5: pispbe video20-35,
+    # rpi-hevc-dec video19) + media-Controller. Alle video/media-Devices durchreichen.
+    devices:
+      - /dev/video19:/dev/video19
+      - /dev/video20:/dev/video20
+      - /dev/video21:/dev/video21
+      - /dev/video22:/dev/video22
+      - /dev/video23:/dev/video23
+      - /dev/video24:/dev/video24
+      - /dev/video25:/dev/video25
+      - /dev/video26:/dev/video26
+      - /dev/video27:/dev/video27
+      - /dev/video28:/dev/video28
+      - /dev/video29:/dev/video29
+      - /dev/video30:/dev/video30
+      - /dev/video31:/dev/video31
+      - /dev/video32:/dev/video32
+      - /dev/video33:/dev/video33
+      - /dev/video34:/dev/video34
+      - /dev/video35:/dev/video35
+      - /dev/media0:/dev/media0
+      - /dev/media1:/dev/media1
+      - /dev/media2:/dev/media2
+    # Fuer den HW-Decoder (DMA-BUF/Media-Controller) noetig:
+    #cap_add:
+    #  - SYS_ADMIN        # nur wenn v4l2-Decode im Container Probleme macht
+
+volumes:
+  thumbd-cache:
