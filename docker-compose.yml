@@ -10,10 +10,8 @@ services:
     ports:
       - "8090:8090"          # use internally (behind nginx auth_request) or localhost only
     environment:
-      # THUMBD_ROOTS = which paths INSIDE the container may be served (whitelist).
-      # It must match the mount below: a file is only served if it is under one of
-      # these roots. Keep it simple: mount your folder as /data and use "/data".
-      THUMBD_ROOTS: "/data"
+      # The media root is ALWAYS /data (hardcoded whitelist) — map your folder(s)
+      # below so they appear under /data. No THUMBD_ROOTS env needed.
       # Token for request auth (empty = no auth — ONLY use behind nginx auth_request!)
       THUMBD_TOKEN: "${THUMBD_TOKEN:-}"
       # The daemon drops to this uid:gid after startup (via su-exec). Set it to your

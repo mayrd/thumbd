@@ -27,7 +27,6 @@ USER node
 
 EXPOSE 8090
 ENV THUMBD_PORT=8090 \
-    THUMBD_ROOTS=/data \
     THUMBD_CACHE=/cache \
     THUMBD_V4L2=h264_v4l2m2m
 

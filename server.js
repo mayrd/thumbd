@@ -11,7 +11,9 @@ const { execFile } = require('child_process');
 
 // ---------- Configuration (env) ----------
 const PORT = parseInt(process.env.THUMBD_PORT || '8090', 10);
-const ROOTS = (process.env.THUMBD_ROOTS || '/data').split(',').map(s => s.trim()).filter(Boolean);
+// The media root is ALWAYS /data — mount your folders there (docker-compose).
+// No THUMBD_ROOTS env: keeps the whitelist simple and predictable.
+let ROOTS = ['/data'];
 const TOKEN = process.env.THUMBD_TOKEN || '';            // empty = no auth (internal only)
 const CACHE_DIR = process.env.THUMBD_CACHE || '/cache';
 const CACHE_MAX_AGE = 60 * 60 * 24 * 7;                  // 7 day disk cache
@@ -438,9 +440,12 @@ if (require.main === module) {
   main().catch(e => { log('fatal:', e); process.exit(1); });
 }
 
+// Test hook: tests run with a temp dir instead of /data (ROOTS is otherwise fixed).
+function setRoots(roots) { ROOTS = Array.isArray(roots) ? roots : [roots]; }
+
 module.exports = {
   handle, main, resolveAllowed, cachePath, probeVideo, hasV4l2Decoder, pickDecoder,
   makeImageThumb, makeVideoThumb, makeVideoPreview, makeVideoSlideshow, makeVideoMix,
   buildAnimatedWebP, extractVideoFrame,
-  ROOTS, CACHE_DIR, TOKEN, PORT,
+  setRoots, ROOTS, CACHE_DIR, TOKEN, PORT,
 };

@@ -16,12 +16,12 @@ const ROOT = path.join(TMP, 'media');
 const CACHE = path.join(TMP, 'cache');
 fs.mkdirSync(ROOT, { recursive: true });
 
-process.env.THUMBD_ROOTS = ROOT;
 process.env.THUMBD_CACHE = CACHE;
 process.env.THUMBD_TOKEN = 'testtoken123';
 process.env.THUMBD_PORT = '0'; // ephemeral
 
 const thumbd = require('../server.js');
+thumbd.setRoots([ROOT]); // tests run on a temp dir; production root is always /data
 
 let server;
 let baseUrl;

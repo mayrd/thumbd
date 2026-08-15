@@ -7,7 +7,7 @@ container on ARM64 and amd64.
 - **Images:** `sharp` (libvips) — 5–20× faster than ImageMagick, ~1/10 the RAM
 - **Videos:** `ffmpeg` — hardware decode where available, software otherwise
 - **Architecture:** the daemon stays warm in memory — no process spawn per request
-- **Security:** path whitelist (only configured roots, symlink-safe), optional token, size limits
+- **Security:** path whitelist (always `/data`, symlink-safe), optional token, size limits
 - **Cache:** disk cache with ETag + `Cache-Control: max-age=604800`
 
 ## Quickstart
@@ -25,12 +25,11 @@ services:
     ports:
       - "8090:8090"
     environment:
-      THUMBD_ROOTS: "/data"              # which paths inside the container may be served
       THUMBD_TOKEN: "${THUMBD_TOKEN:-}"  # empty = no auth (internal only!)
       PUID: "1000"                 # run as your host user's uid:gid (default 1000:1000)
       PGID: "1000"
     volumes:
-      - /home/USER:/data:ro              # >>> your media folder <<<
+      - /home/USER:/data:ro              # >>> your media folder, always mounted as /data <<<
       - thumbd-cache:/cache
 
 volumes:
@@ -46,18 +45,22 @@ curl -s -o t.webp "http://localhost:8090/thumb?path=/data/test.jpg&w=320&h=320"
 
 ## How it works
 
-### Volume mount vs. THUMBD_ROOTS
+### The /data root
 
-These are two different things that must match:
+The media root is **always `/data`** — there is no `THUMBD_ROOTS` configuration.
+Whatever you mount at `/data` inside the container is what the daemon serves:
 
 - **The volume mount** (`/home/USER:/data`) makes your folder *visible* inside the container.
-- **`THUMBD_ROOTS`** is the *security whitelist*: which paths inside the container the daemon
-  is allowed to serve. A file is served only if it is under one of these roots — everything
+- The daemon serves files **only** under `/data` (symlink-safe whitelist) — everything
   else returns `403`.
 
-Keep it simple: mount your folder as `/data` and set `THUMBD_ROOTS: "/data"`. For multiple
-folders, add them to both — e.g. `THUMBD_ROOTS: "/data,/mnt/pcloud"` plus
-`- /mnt/pcloud:/mnt/pcloud`.
+Mount a single folder as `/data`, or merge several by mounting them into subfolders:
+
+```yaml
+    volumes:
+      - /home/USER/media:/data            # serves /data/...
+      - /mnt/pcloud:/data/pcloud         # also serves /data/pcloud/...
+```
 
 ### User and group
 
@@ -78,7 +81,7 @@ GET /health
 
 | Parameter | Meaning |
 |---|---|
-| `path` | A file inside one of the configured roots (otherwise 403). Absolute, or relative to the first root. |
+| `path` | A file inside `/data` (otherwise 403). Absolute (`/data/...`), or relative to `/data`. |
 | `w`, `h` | Target size (max 1024, no upscaling) |
 | `t` | Video timestamp in seconds for `still` (default 1) and `preview` start (default 1) |
 | `fit` | `contain` (default — scale to fit the box, keep the source aspect ratio, no crop) or `cover` (fill the box exactly, cropping overflow). Passed through to sharp/ffmpeg. |
@@ -97,7 +100,6 @@ GET /health
 | Variable | Default | Meaning |
 |---|---|---|
 | `THUMBD_PORT` | `8090` | HTTP port |
-| `THUMBD_ROOTS` | `/data` | Comma-separated root paths (whitelist, symlink-safe) |
 | `THUMBD_CACHE` | `/cache` | Disk cache directory |
 | `THUMBD_TOKEN` | *(empty)* | Request token; empty = no auth (only use behind nginx) |
 | `PUID` / `PGID` | `1000` / `1000` | User the daemon drops to (set to your host user's ids) |
