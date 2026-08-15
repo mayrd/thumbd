@@ -21,7 +21,7 @@ const MAX_SRC_MB = parseInt(process.env.THUMBD_MAX_SRC_MB || '4096', 10); // sou
 const VIDEO_MAX_SEC = parseInt(process.env.THUMBD_VIDEO_MAX_SEC || '600', 10); // videos >10min: only first 10min
 const FFMPEG = process.env.THUMBD_FFMPEG || 'ffmpeg';
 const FFPROBE = process.env.THUMBD_FFPROBE || 'ffprobe';
-const V4L2 = process.env.THUMBD_V4L2 || 'h264_v4l2m2m';   // HW decoder, if available
+const V4L2 = process.env.THUMBD_V4L2 || 'drm';            // HW accel: 'drm' = stateless V4L2 (Pi 5 HEVC); '' = off
 const IMAGE_EXTS = new Set(['.jpg', '.jpeg', '.png', '.webp', '.gif', '.avif', '.tif', '.tiff', '.bmp']);
 const VIDEO_EXTS = new Set(['.mp4', '.mov', '.mpg', '.mpeg', '.avi', '.flv', '.wmv', '.asf', '.mkv', '.webm', '.m4v', '.ts']);
 
@@ -69,13 +69,16 @@ function probeVideo(realPath) {
 
 function hasV4l2Decoder(decoder) {
   return new Promise((resolve) => {
-    // v4l2-m2m needs real /dev/video* devices in the container (Pi 5: video19+)
+    // HW decode needs real /dev/video* devices in the container (Pi 5: video19+)
     let hasDev = false;
     try {
       hasDev = fs.readdirSync('/dev').some(n => n.startsWith('video'));
     } catch { hasDev = false; }
     if (!hasDev) return resolve(false);
-    execFile(FFMPEG, ['-hide_banner', '-decoders'], { timeout: 10000 }, (err, stdout) => {
+    // `drm` is a HWACCEL (checked via -hwaccels), not a codec in -decoders.
+    // The Pi 5 stateless V4L2 HEVC path is reached with `-hwaccel drm` (rpt ffmpeg).
+    const args = decoder === 'drm' ? ['-hide_banner', '-hwaccels'] : ['-hide_banner', '-decoders'];
+    execFile(FFMPEG, args, { timeout: 10000 }, (err, stdout) => {
       if (err) return resolve(false);
       resolve(stdout.includes(decoder));
     });
@@ -83,9 +86,15 @@ function hasV4l2Decoder(decoder) {
 }
 
 // Pi 5: NO HW H.264 decoder (only HEVC via rpi-hevc-dec) — h264 stays software.
+// HEVC HW decode uses the STATELESS V4L2 path (`-hwaccel drm`), NOT the mem2mem
+// wrapper: `hevc_v4l2m2m` fails on the rpi-hevc-dec with "can't configure decoder:
+// Invalid argument" (the rpi decoder is stateless, the wrapper is stateful m2m).
+// Requires the Raspberry-Pi-OS ffmpeg (rpt build) in the container — bind it from
+// the host (see compose: /usr/bin/ffmpeg → /custom-ffmpeg/bin/ffmpeg) or install
+// the rpi packages; the stock Debian ffmpeg has no "V4L2 HEVC stateless" hwaccel.
 function pickDecoder(codec, v4l2Available) {
   if (!v4l2Available || !codec) return null;
-  if (codec === 'hevc' || codec === 'h265') return 'hevc_v4l2m2m';
+  if (codec === 'hevc' || codec === 'h265') return 'drm';   // -hwaccel drm (stateless)
   return null; // h264/mpeg/... => software
 }
 
@@ -102,7 +111,7 @@ async function makeImageThumb(realPath, w, h, outTmp, fit = 'contain') {
 
 async function makeVideoThumb(realPath, w, h, t, outTmp, decoder, fit = 'contain') {
   const seek = Math.max(0, t);
-  const decArgs = decoder ? ['-c:v', decoder] : [];   // null = software
+  const decArgs = decoder ? ['-hwaccel', decoder] : [];   // null = software; 'drm' = stateless V4L2 (Pi 5 HEVC)
   // cover = scale up to fill + crop to exact box; contain = keep source ratio
   const vf = fit === 'cover'
     ? `scale=${w}:${h}:force_original_aspect_ratio=increase,crop=${w}:${h}`
@@ -147,7 +156,7 @@ async function makeVideoPreview(realPath, w, h, t, d, fps, outTmp, decoder, fit 
 
 // Extract a single still frame to a file (helper for slideshow)
 async function extractVideoFrame(realPath, ts, w, h, outFile, decoder, fit = 'contain') {
-  const decArgs = decoder ? ['-c:v', decoder] : [];
+  const decArgs = decoder ? ['-hwaccel', decoder] : [];   // 'drm' = stateless V4L2 (Pi 5 HEVC)
   const vf = fit === 'cover'
     ? `scale=${w}:${h}:force_original_aspect_ratio=increase,crop=${w}:${h}`
     : `scale=${w}:${h}:force_original_aspect_ratio=decrease`;

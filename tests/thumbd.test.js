@@ -101,9 +101,11 @@ function post(p, headers = {}) {
 }
 
 // ---------- Unit: pickDecoder ----------
-test('pickDecoder: HEVC gets the HW decoder', () => {
-  assert.equal(thumbd.pickDecoder('hevc', true), 'hevc_v4l2m2m');
-  assert.equal(thumbd.pickDecoder('h265', true), 'hevc_v4l2m2m');
+test('pickDecoder: HEVC gets the drm hwaccel (stateless V4L2, Pi 5)', () => {
+  // hevc_v4l2m2m (stateful mem2mem) fails on the rpi-hevc-dec; the stateless
+  // path uses `-hwaccel drm` (requires the rpt ffmpeg build in the container).
+  assert.equal(thumbd.pickDecoder('hevc', true), 'drm');
+  assert.equal(thumbd.pickDecoder('h265', true), 'drm');
 });
 
 test('pickDecoder: H.264/others software only (Pi 5 has no HW H.264)', () => {
