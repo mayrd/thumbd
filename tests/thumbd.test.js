@@ -101,6 +101,21 @@ function post(p, headers = {}) {
 }
 
 // ---------- Unit: pickDecoder ----------
+test('withJobLock: serializes concurrent jobs (max 2 parallel)', async () => {
+  const { withJobLock } = thumbd;
+  let running = 0, maxRunning = 0, done = 0;
+  const job = () => withJobLock(async () => {
+    running++;
+    maxRunning = Math.max(maxRunning, running);
+    await new Promise(r => setTimeout(r, 30));
+    running--;
+    done++;
+  });
+  await Promise.all([job(), job(), job(), job(), job()]);
+  assert.equal(done, 5);
+  assert.ok(maxRunning <= 2, `expected max 2 parallel, got ${maxRunning}`);
+});
+
 test('pickDecoder: HEVC gets the drm hwaccel (stateless V4L2, Pi 5)', () => {
   // hevc_v4l2m2m (stateful mem2mem) fails on the rpi-hevc-dec; the stateless
   // path uses `-hwaccel drm` (requires the rpt ffmpeg build in the container).

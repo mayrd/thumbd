@@ -306,6 +306,32 @@ function stripWebpContainer(buf) {
   return Buffer.concat(parts);
 }
 
+// ---------- Concurrency limiter ----------
+// 20 parallel mode=mix requests would spawn 600+ ffmpeg processes on a Pi 5 and
+// time everything out. Serialize video generation: MAX_JOBS ffmpeg jobs run in
+// parallel, the rest wait in a FIFO queue. Images are cheap — they bypass it.
+const MAX_JOBS = Math.max(1, parseInt(process.env.THUMBD_MAX_JOBS || '2', 10));
+let activeJobs = 0;
+const jobQueue = [];
+
+function withJobLock(fn) {
+  return new Promise((resolve, reject) => {
+    const run = () => {
+      activeJobs++;
+      fn().then(
+        (v) => { activeJobs--; pump(); resolve(v); },
+        (e) => { activeJobs--; pump(); reject(e); }
+      );
+    };
+    const pump = () => {
+      const next = jobQueue.shift();
+      if (next) next();
+    };
+    if (activeJobs < MAX_JOBS) run();
+    else jobQueue.push(run);
+  });
+}
+
 // ---------- Request handler ----------
 async function handle(req, res) {
   if (req.method !== 'GET') return send(res, 405, 'method not allowed (only GET)');
@@ -397,13 +423,16 @@ async function handle(req, res) {
   await fsp.mkdir(path.dirname(cp), { recursive: true });
   try {
     if (isVideo) {
-      const info = await probeVideo(real);
-      const v4l2 = await hasV4l2Decoder(V4L2).catch(() => false);
-      const decoder = pickDecoder(info ? info.codec : null, v4l2);
-      const dur = info ? info.duration : null;
-      // clamp seek time for long videos (still/preview only)
-      const seek = (dur !== null && t > dur) ? Math.max(0, Math.min(VIDEO_MAX_SEC, dur / 2)) : t;
-      const generate = async (dec) => {
+      // Video generation is heavy (mix = 30+ ffmpeg calls) — run it through the
+      // concurrency limiter so N parallel requests don't spawn N*30 processes.
+      await withJobLock(async () => {
+        const info = await probeVideo(real);
+        const v4l2 = await hasV4l2Decoder(V4L2).catch(() => false);
+        const decoder = pickDecoder(info ? info.codec : null, v4l2);
+        const dur = info ? info.duration : null;
+        // clamp seek time for long videos (still/preview only)
+        const seek = (dur !== null && t > dur) ? Math.max(0, Math.min(VIDEO_MAX_SEC, dur / 2)) : t;
+        const generate = async (dec) => {
         if (mode === 'preview') {
           // clamp the preview window to the video end (short videos, ts >= dur fails)
           const dEff = dur !== null ? Math.max(0.05, Math.min(d, dur - seek)) : d;
@@ -449,6 +478,7 @@ async function handle(req, res) {
           await generate(null);
         } else throw hwErr;
       }
+      }); // end withJobLock
     } else {
       await makeImageThumb(real, w, h, outTmp, fit);
     }
@@ -488,6 +518,6 @@ function setRoots(roots) { ROOTS = Array.isArray(roots) ? roots : [roots]; }
 module.exports = {
   handle, main, resolveAllowed, cachePath, probeVideo, hasV4l2Decoder, pickDecoder,
   makeImageThumb, makeVideoThumb, makeVideoPreview, makeVideoSlideshow, makeVideoMix,
-  buildAnimatedWebP, extractVideoFrame,
+  buildAnimatedWebP, extractVideoFrame, withJobLock,
   setRoots, ROOTS, CACHE_DIR, TOKEN, PORT,
 };
