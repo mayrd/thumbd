@@ -251,6 +251,32 @@ test('GET /thumb nocache=1 skips cache read but still writes', async () => {
 });
 
 // ---------- Integration: video thumbnail ----------
+test('GET /duration video -> JSON with duration', async () => {
+  const r = await get(`/duration?path=${encodeURIComponent('test.mp4')}`, { 'X-Thumb-Token': 'testtoken123' });
+  assert.equal(r.status, 200, r.body.toString().slice(0, 200));
+  assert.match(r.headers['content-type'], /application\/json/);
+  const body = JSON.parse(r.body.toString());
+  assert.ok(Math.abs(body.duration - 12) < 1, `expected ~12s, got ${body.duration}`);
+  // second call served from cache
+  const r2 = await get(`/duration?path=${encodeURIComponent('test.mp4')}`, { 'X-Thumb-Token': 'testtoken123' });
+  assert.equal(r2.status, 200);
+  assert.equal(JSON.parse(r2.body.toString()).duration, body.duration);
+});
+
+test('GET /duration short video -> 200', async () => {
+  const r = await get(`/duration?path=${encodeURIComponent('short.mp4')}`, { 'X-Thumb-Token': 'testtoken123' });
+  assert.equal(r.status, 200, r.body.toString().slice(0, 200));
+  const body = JSON.parse(r.body.toString());
+  assert.ok(Math.abs(body.duration - 2) < 0.5, `expected ~2s, got ${body.duration}`);
+});
+
+test('GET /duration missing path -> 400, outside root -> 403', async () => {
+  const r1 = await get('/duration', { 'X-Thumb-Token': 'testtoken123' });
+  assert.equal(r1.status, 400);
+  const r2 = await get(`/duration?path=${encodeURIComponent('/etc/passwd')}`, { 'X-Thumb-Token': 'testtoken123' });
+  assert.equal(r2.status, 403);
+});
+
 test('GET /thumb video (H.264) -> 200 WebP', async () => {
   const r = await get(`/thumb?path=${encodeURIComponent('test.mp4')}&w=100&h=100&t=0`, { 'X-Thumb-Token': 'testtoken123' });
   assert.equal(r.status, 200, r.body.toString().slice(0, 200));

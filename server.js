@@ -311,6 +311,29 @@ async function handle(req, res) {
     const ok = a.length === b.length && crypto.timingSafeEqual(a, b);
     if (!ok) return send(res, 401, 'unauthorized');
   }
+  // Duration metadata: GET /duration?path=<abs> -> JSON {"duration": 12.34}
+  // Used by xplorer's getMediaLength() — thumbd owns ffprobe, so the app image
+  // stays slim (no ffmpeg/ffprobe binaries needed in the PHP container).
+  if (u.pathname === '/duration') {
+    const dp = u.searchParams.get('path');
+    if (!dp) return send(res, 400, 'missing path');
+    const dAbs = path.isAbsolute(dp) ? dp : path.join(ROOTS[0], dp);
+    const dReal = await resolveAllowed(dAbs);
+    if (!dReal) return send(res, 403, 'path not allowed or not found');
+    // cache: duration of a file never changes → key on realPath only
+    const dKey = crypto.createHash('sha1').update(`duration|${dReal}`).digest('hex');
+    const dFile = path.join(CACHE_DIR, dKey.slice(0, 2), dKey + '.json');
+    try {
+      const cached = await fsp.readFile(dFile, 'utf8');
+      return send(res, 200, cached, { 'Content-Type': 'application/json', 'Cache-Control': 'public, max-age=604800' });
+    } catch { /* cache miss */ }
+    const dInfo = await probeVideo(dReal);
+    const dur = (dInfo && dInfo.duration !== null) ? dInfo.duration : 0;
+    const body = JSON.stringify({ duration: dur });
+    await fsp.mkdir(path.dirname(dFile), { recursive: true }).catch(() => {});
+    await fsp.writeFile(dFile, body).catch(() => {});
+    return send(res, 200, body, { 'Content-Type': 'application/json', 'Cache-Control': 'public, max-age=604800' });
+  }
   if (u.pathname !== '/thumb') return send(res, 404, 'not found: use /thumb?path=...&w=...&h=...&t=...');
 
   const p = u.searchParams.get('path');
