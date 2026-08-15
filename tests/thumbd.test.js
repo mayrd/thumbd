@@ -27,6 +27,7 @@ let server;
 let baseUrl;
 let testImage;   // test image path inside the root
 let testVideo;   // test video path inside the root
+let shortVideo;  // SHORT video (2s) — regression: mix/preview used to seek past the end → 500
 
 before(async () => {
   // Generate a test image (sharp) — small red PNG
@@ -45,6 +46,20 @@ before(async () => {
       '-f', 'lavfi', '-i', 'anullsrc=r=44100:cl=stereo',
       '-t', '12', '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-c:a', 'aac',
       testVideo,
+    ], { timeout: 90000 }, (err) => err ? reject(err) : resolve());
+  });
+
+  // Short video (2s) — shorter than the default preview window (t=1 + d=3 = 4s).
+  // Regression (2026-08-15): mix/preview used to seek past the video end → ffmpeg
+  // finds no frame at ts >= duration → HTTP 500. Must clamp to the video end.
+  shortVideo = path.join(ROOT, 'short.mp4');
+  await new Promise((resolve, reject) => {
+    const { execFile } = require('node:child_process');
+    execFile('ffmpeg', [
+      '-y', '-hide_banner', '-loglevel', 'error',
+      '-f', 'lavfi', '-i', 'testsrc2=s=64x48:d=2:r=10',
+      '-t', '2', '-c:v', 'libx264', '-pix_fmt', 'yuv420p',
+      shortVideo,
     ], { timeout: 90000 }, (err) => err ? reject(err) : resolve());
   });
 
@@ -287,6 +302,34 @@ test('GET /thumb video mode=mix custom params -> animated WebP', async () => {
   assert.equal(r.status, 200, r.body.toString().slice(0, 200));
   const meta = await sharp(r.body).metadata();
   assert.ok(meta.pages >= 11 && meta.pages <= 13, `expected ~12 frames, got pages=${meta.pages}`);
+});
+
+test('GET /thumb SHORT video (2s) mode=mix -> 200 (clamped preview window)', async () => {
+  // Regression 2026-08-15: videos shorter than the default preview window (t=1+d=3=4s)
+  // used to fail with 500 — ffmpeg seeks past the last frame (ts >= duration).
+  // The preview window must be clamped to the video end; slideshow falls back to
+  // a single frame at the middle when the preview already covers the whole video.
+  const r = await get(`/thumb?path=${encodeURIComponent('short.mp4')}&w=100&h=100&mode=mix`, { 'X-Thumb-Token': 'testtoken123' });
+  assert.equal(r.status, 200, r.body.toString().slice(0, 200));
+  assert.equal(r.headers['content-type'], 'image/webp');
+  const meta = await sharp(r.body).metadata();
+  assert.ok(meta.pages >= 2, `expected animated webp, got pages=${meta.pages}`);
+});
+
+test('GET /thumb SHORT video (2s) mode=preview -> 200 (clamped preview window)', async () => {
+  const r = await get(`/thumb?path=${encodeURIComponent('short.mp4')}&w=100&h=100&mode=preview&t=1&d=3&fps=10`, { 'X-Thumb-Token': 'testtoken123' });
+  assert.equal(r.status, 200, r.body.toString().slice(0, 200));
+  assert.equal(r.headers['content-type'], 'image/webp');
+  const meta = await sharp(r.body).metadata();
+  assert.ok(meta.pages >= 2, `expected animated webp, got pages=${meta.pages}`);
+});
+
+test('GET /thumb SHORT video (2s) mode=slideshow count=3 -> 200', async () => {
+  const r = await get(`/thumb?path=${encodeURIComponent('short.mp4')}&w=100&h=100&mode=slideshow&count=3`, { 'X-Thumb-Token': 'testtoken123' });
+  assert.equal(r.status, 200, r.body.toString().slice(0, 200));
+  assert.equal(r.headers['content-type'], 'image/webp');
+  const meta = await sharp(r.body).metadata();
+  assert.ok(meta.pages >= 2, `expected animated webp, got pages=${meta.pages}`);
 });
 
 test('mix animation frame delays are correct (webp ANMF chunks)', async () => {

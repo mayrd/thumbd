@@ -373,24 +373,34 @@ async function handle(req, res) {
       const seek = (dur !== null && t > dur) ? Math.max(0, Math.min(VIDEO_MAX_SEC, dur / 2)) : t;
       const generate = async (dec) => {
         if (mode === 'preview') {
-          await makeVideoPreview(real, w, h, seek, d, fps, outTmp, dec, fit);
+          // clamp the preview window to the video end (short videos, ts >= dur fails)
+          const dEff = dur !== null ? Math.max(0.05, Math.min(d, dur - seek)) : d;
+          await makeVideoPreview(real, w, h, seek, dEff, fps, outTmp, dec, fit);
         } else if (mode === 'slideshow' || mode === 'mix') {
           // build the frame timestamps: interval (every N s) or count (N evenly spaced)
           let times;
           if (!dur) throw new Error(`${mode} needs a probeable video duration`);
-          // mix: slideshow covers only the video AFTER the preview window (t+d)
-          const restStart = mode === 'mix' ? Math.min(seek + d, dur) : 0;
+          // mix: slideshow covers only the video AFTER the preview window (t+d).
+          // Clamp the preview window to the video end so SHORT videos (< t+d) don't
+          // seek past the last frame (ffmpeg fails on ts >= duration → 500).
+          const dEff = mode === 'mix' ? Math.max(0.05, Math.min(d, dur - seek)) : d;
+          const restStart = mode === 'mix' ? Math.min(seek + dEff, dur) : 0;
           const restLen = Math.max(0, dur - restStart);
           if (interval > 0) {
             times = [];
             for (let ts = restStart + interval; ts < dur && times.length < 60; ts += interval) times.push(ts);
-            if (!times.length) times = [Math.max(restStart + 0.5, dur / 2)];
+            if (!times.length) times = restLen >= 0.5 ? [Math.max(restStart + 0.5, dur / 2)] : [Math.max(0.1, dur / 2)];
           } else {
             times = [];
-            for (let i = 1; i <= count; i++) times.push(restStart + restLen * i / (count + 1));
+            if (restLen >= 0.5) {
+              for (let i = 1; i <= count; i++) times.push(restStart + restLen * i / (count + 1));
+            } else {
+              // preview already covers (nearly) the whole video → single frame at the middle
+              times = [Math.max(0.1, dur / 2)];
+            }
           }
           if (mode === 'mix') {
-            await makeVideoMix(real, w, h, seek, d, fps, times, outTmp, dec, fit);
+            await makeVideoMix(real, w, h, seek, dEff, fps, times, outTmp, dec, fit);
           } else {
             await makeVideoSlideshow(real, w, h, times, outTmp, dec, fit);
           }
