@@ -19,8 +19,8 @@ services:
       # The daemon drops to this uid:gid after startup (via su-exec). Set it to your
       # HOST user's uid:gid (default 1000:1000 = typical first user on a Pi) so file
       # permissions on the mounted media work without chmod gymnastics.
-      THUMBD_UID: "1000"
-      THUMBD_GID: "1000"
+      PUID: "1000"
+      PGID: "1000"
     volumes:
       # >>> Your media folder, mounted read-only (thumbd never writes to sources) <<<
       - /home/USER:/data:ro

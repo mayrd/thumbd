@@ -27,8 +27,8 @@ services:
     environment:
       THUMBD_ROOTS: "/data"              # which paths inside the container may be served
       THUMBD_TOKEN: "${THUMBD_TOKEN:-}"  # empty = no auth (internal only!)
-      THUMBD_UID: "1000"                 # run as your host user's uid:gid (default 1000:1000)
-      THUMBD_GID: "1000"
+      PUID: "1000"                 # run as your host user's uid:gid (default 1000:1000)
+      PGID: "1000"
     volumes:
       - /home/USER:/data:ro              # >>> your media folder <<<
       - thumbd-cache:/cache
@@ -63,9 +63,9 @@ folders, add them to both — e.g. `THUMBD_ROOTS: "/data,/mnt/pcloud"` plus
 
 The container starts as **root only briefly**: the entrypoint chowns the cache volume
 (named volumes initially belong to root) and opens up the v4l2 devices, then drops
-privileges via `su-exec` to `THUMBD_UID:THUMBD_GID` (default `1000:1000`).
+privileges via `su-exec` to `PUID:PGID` (default `1000:1000`).
 
-Set `THUMBD_UID`/`THUMBD_GID` to your **host user's ids** — uid 1000 is the typical first
+Set `PUID`/`PGID` to your **host user's ids** — uid 1000 is the typical first
 user on a Raspberry Pi. Because the container user then has the same uid as your host user,
 file permissions on the mounted media folders work without chmod gymnastics.
 
@@ -100,7 +100,7 @@ GET /health
 | `THUMBD_ROOTS` | `/data` | Comma-separated root paths (whitelist, symlink-safe) |
 | `THUMBD_CACHE` | `/cache` | Disk cache directory |
 | `THUMBD_TOKEN` | *(empty)* | Request token; empty = no auth (only use behind nginx) |
-| `THUMBD_UID` / `THUMBD_GID` | `1000` / `1000` | User the daemon drops to (set to your host user's ids) |
+| `PUID` / `PGID` | `1000` / `1000` | User the daemon drops to (set to your host user's ids) |
 | `THUMBD_MAX_SRC_MB` | `4096` | Max source file size (TV episodes are often 1–2 GB) |
 | `THUMBD_VIDEO_MAX_SEC` | `600` | Videos >10 min: still from the first half |
 
@@ -154,10 +154,10 @@ PHP-style thumbnailer).
   thumbd picks the decoder via ffprobe: HEVC → `hevc_v4l2m2m`, otherwise software,
   with an automatic software retry if the HW path fails.
 - **The cache volume initially belongs to root** — the entrypoint chowns `/cache`
-  to the configured user (root → `THUMBD_UID:THUMBD_GID`) via `su-exec`.
+  to the configured user (root → `PUID:PGID`) via `su-exec`.
 - **`su-exec` only sets uid:gid, no supplementary groups** — that is why the entrypoint
   opens the v4l2 devices with `chmod 666` instead of relying on groups.
 - **A missing device in `devices:` prevents the container from starting** — only add
   v4l2 devices you actually have, or leave the whole block out.
 - Alpine's `node:20-alpine` already ships a user with uid 1000 (`node`) — the entrypoint
-  uses numeric `su-exec`, so `THUMBD_UID` can be any value without extra user setup.
+  uses numeric `su-exec`, so `PUID` can be any value without extra user setup.

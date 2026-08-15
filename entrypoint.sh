@@ -4,11 +4,11 @@
 # (named volumes initially belong to root) and to open up the v4l2 devices; it then
 # drops privileges via su-exec.
 #
-# THUMBD_UID / THUMBD_GID default to 1000:1000 — set them to your host user's ids so
+# PUID / PGID default to 1000:1000 — set them to your host user's ids so
 # file permissions on the mounted media folders just work (no chmod gymnastics).
 set -e
-UID_NUM="${THUMBD_UID:-1000}"
-GID_NUM="${THUMBD_GID:-1000}"
+UID_NUM="${PUID:-1000}"
+GID_NUM="${PGID:-1000}"
 
 mkdir -p /cache /data
 chown -R "$UID_NUM:$GID_NUM" /cache 2>/dev/null || true
