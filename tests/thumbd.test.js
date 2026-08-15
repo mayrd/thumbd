@@ -289,6 +289,33 @@ test('GET /thumb video mode=mix custom params -> animated WebP', async () => {
   assert.ok(meta.pages >= 11 && meta.pages <= 13, `expected ~12 frames, got pages=${meta.pages}`);
 });
 
+test('mix animation frame delays are correct (webp ANMF chunks)', async () => {
+  // Regression for ffmpeg-8 webp muxer bug (mixed/short delays corrupted).
+  // mix t=0 d=1 fps=4 count=1: preview = 4 frames @250ms, slideshow = 1 frame @1000ms
+  const r = await get(`/thumb?path=${encodeURIComponent('test.mp4')}&w=100&h=100&mode=mix&t=0&d=1&fps=4&count=1`, { 'X-Thumb-Token': 'testtoken123' });
+  assert.equal(r.status, 200, r.body.toString().slice(0, 200));
+  const delays = parseWebpDelays(r.body);
+  assert.equal(delays.length, 5, `expected 5 frames, got ${delays.length}: ${delays}`);
+  assert.deepEqual(delays, [250, 250, 250, 250, 1000], `unexpected delays: ${delays}`);
+});
+
+// Parse the per-frame durations (ms) out of an animated WebP (ANMF chunks)
+function parseWebpDelays(buf) {
+  if (buf.toString('latin1', 0, 4) !== 'RIFF') return [];
+  const out = [];
+  let i = 12;
+  while (i + 8 <= buf.length) {
+    const tag = buf.toString('latin1', i, i + 4);
+    const size = buf.readUInt32LE(i + 4);
+    if (tag === 'ANMF') {
+      // payload: x(3) y(3) w(3) h(3) duration(3 LE) flags(1)
+      out.push(buf.readUIntLE(i + 8 + 12, 3));
+    }
+    i += 8 + size + (size % 2);
+  }
+  return out;
+}
+
 test('GET /thumb video modes have separate cache entries', async () => {
   const p = (extra) => `/thumb?path=${encodeURIComponent('test.mp4')}&w=60&h=60${extra}`;
   const r1 = await get(p(''), { 'X-Thumb-Token': 'testtoken123' });                                  // still

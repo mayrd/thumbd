@@ -173,28 +173,12 @@ async function makeVideoSlideshow(realPath, w, h, times, outTmp, decoder, fit = 
     for (let i = 0; i < times.length; i++) {
       const f = `${outTmp}.f${i}`;
       await extractVideoFrame(realPath, times[i], w, h, f, decoder, fit);
-      frames.push(f);
+      frames.push(await fsp.readFile(f));
     }
-    // Concatenate the stills into an animated WebP (each shown 1s)
-    const inputs = [];
-    const filterParts = [];
-    frames.forEach((f, i) => {
-      inputs.push('-loop', '1', '-t', '1', '-i', f);
-      filterParts.push(`[${i}:v]`);
-    });
-    await new Promise((resolve, reject) => {
-      execFile(FFMPEG, [
-        '-y', '-hide_banner', '-loglevel', 'error',
-        ...inputs,
-        '-filter_complex', `${filterParts.join('')}concat=n=${frames.length}:v=1`,
-        '-loop', '0',
-        '-q:v', '4',
-        '-f', 'webp',
-        outTmp,
-      ], { timeout: 90000 }, (err) => err ? reject(err) : resolve());
-    });
+    const anim = await buildAnimatedWebP(frames, frames.map(() => 1000));  // 1s per frame
+    await fsp.writeFile(outTmp, anim);
   } finally {
-    for (const f of frames) await fsp.unlink(f).catch(() => {});
+    for (let i = 0; i < frames.length; i++) await fsp.unlink(`${outTmp}.f${i}`).catch(() => {});
   }
 }
 
@@ -202,43 +186,113 @@ async function makeVideoSlideshow(realPath, w, h, times, outTmp, decoder, fit = 
 // remaining video (count evenly spaced frames, or one frame every interval seconds).
 // Preview frames are shown at 1/fps s each, slideshow frames for 1 s each.
 async function makeVideoMix(realPath, w, h, t, d, fps, times, outTmp, decoder, fit = 'contain') {
-  const frames = [];   // {path, dur}
+  const frames = [];   // {buf, dur}
   try {
     // 1) preview frames: fps*d frames from t..t+d, each displayed 1/fps s
     const nPrev = Math.max(1, Math.round(fps * d));
+    const pFiles = [];
     for (let i = 0; i < nPrev; i++) {
       const ts = Math.max(0, t + i / fps);
       const f = `${outTmp}.p${i}`;
       await extractVideoFrame(realPath, ts, w, h, f, decoder, fit);
-      frames.push({ path: f, dur: 1 / fps });
+      pFiles.push(f);
     }
+    for (const f of pFiles) frames.push({ buf: await fsp.readFile(f), dur: 1000 / fps });
     // 2) slideshow frames of the remaining video, each displayed 1 s
+    const sFiles = [];
     for (let i = 0; i < times.length; i++) {
       const f = `${outTmp}.s${i}`;
       await extractVideoFrame(realPath, times[i], w, h, f, decoder, fit);
-      frames.push({ path: f, dur: 1 });
+      sFiles.push(f);
     }
-    // 3) concat all frames into one animated WebP with per-frame durations
-    const inputs = [];
-    const filterParts = [];
-    frames.forEach((fr, i) => {
-      inputs.push('-loop', '1', '-t', String(fr.dur), '-i', fr.path);
-      filterParts.push(`[${i}:v]`);
-    });
-    await new Promise((resolve, reject) => {
-      execFile(FFMPEG, [
-        '-y', '-hide_banner', '-loglevel', 'error',
-        ...inputs,
-        '-filter_complex', `${filterParts.join('')}concat=n=${frames.length}:v=1`,
-        '-loop', '0',
-        '-q:v', '4',
-        '-f', 'webp',
-        outTmp,
-      ], { timeout: 120000 }, (err) => err ? reject(err) : resolve());
-    });
+    for (const f of sFiles) frames.push({ buf: await fsp.readFile(f), dur: 1000 });
+    // 3) assemble the animated WebP in Node (ffmpeg 8's webp muxer corrupts mixed delays)
+    const anim = await buildAnimatedWebP(frames.map(fr => fr.buf), frames.map(fr => fr.dur));
+    await fsp.writeFile(outTmp, anim);
   } finally {
-    for (const fr of frames) await fsp.unlink(fr.path).catch(() => {});
+    for (let i = 0; i < frames.length; i++) {
+      await fsp.unlink(`${outTmp}.p${i}`).catch(() => {});
+      await fsp.unlink(`${outTmp}.s${i}`).catch(() => {});
+    }
   }
+}
+
+// Build an animated WebP from still frames (each a RIFF/WEBP file with a single
+// VP8/VP8L image chunk). Deterministic, version-independent — ffmpeg's webp muxer
+// corrupts mixed/short frame delays (observed with ffmpeg 8: 0ms / garbage delays).
+// frames: array of Buffers (still webp files). delaysMs: per-frame duration.
+async function buildAnimatedWebP(frames, delaysMs) {
+  if (!frames.length) throw new Error('buildAnimatedWebP: no frames');
+  // canvas size from the first frame's VP8/VP8L image header
+  const dims = await getWebpDims(frames[0]);
+  const W = dims.width, H = dims.height;
+
+  // VP8X chunk (animation flag 0x02), 10 bytes payload
+  const vp8x = Buffer.alloc(10);
+  vp8x.writeUInt8(0x02, 0);                       // flags: animation
+  vp8x.writeUIntLE(W - 1, 4, 3);                  // canvas width - 1
+  vp8x.writeUIntLE(H - 1, 7, 3);                  // canvas height - 1
+
+  // ANIM chunk: background color (4B) + loop count (2B, 0 = infinite)
+  const anim = Buffer.alloc(6);
+  anim.writeUInt32LE(0, 0);                       // background: black
+  anim.writeUInt16LE(0, 4);                       // loop forever
+
+  const chunks = [chunk('VP8X', vp8x), chunk('ANIM', anim)];
+  for (let i = 0; i < frames.length; i++) {
+    const img = stripWebpContainer(frames[i]);
+    const anmf = Buffer.alloc(16 + img.length);
+    anmf.writeUIntLE(0, 0, 3);                    // frame x
+    anmf.writeUIntLE(0, 3, 3);                    // frame y
+    anmf.writeUIntLE(W - 1, 6, 3);                // frame width - 1
+    anmf.writeUIntLE(H - 1, 9, 3);                // frame height - 1
+    anmf.writeUIntLE(Math.max(1, Math.round(delaysMs[i])), 12, 3); // duration ms
+    anmf.writeUInt8(0, 15);                       // flags: no blending (dispose to bg)
+    img.copy(anmf, 16);
+    chunks.push(chunk('ANMF', anmf));
+  }
+
+  const body = Buffer.concat(chunks.map(c => c));
+  const riff = Buffer.alloc(12);
+  riff.write('RIFF', 0, 'latin1');
+  riff.writeUInt32LE(4 + body.length, 4);         // file size - 8
+  riff.write('WEBP', 8, 'latin1');
+  return Buffer.concat([riff, body]);
+}
+
+function chunk(tag, payload) {
+  const b = Buffer.alloc(8 + payload.length);
+  b.write(tag, 0, 'latin1');
+  b.writeUInt32LE(payload.length, 4);
+  payload.copy(b, 8);
+  return b;
+}
+
+// Read width/height from a still WebP's VP8/VP8L image header
+async function getWebpDims(buf) {
+  const sharp = require('sharp');
+  const m = await sharp(buf).metadata();
+  return { width: m.width, height: m.height };
+}
+
+// Strip the RIFF/WEBP container, return the image chunk(s) (VP8 or VP8L) verbatim
+function stripWebpContainer(buf) {
+  if (buf.toString('latin1', 0, 4) !== 'RIFF' || buf.toString('latin1', 8, 12) !== 'WEBP') {
+    throw new Error('stripWebpContainer: not a webp');
+  }
+  let i = 12;
+  const parts = [];
+  while (i + 8 <= buf.length) {
+    const tag = buf.toString('latin1', i, i + 4);
+    const size = buf.readUInt32LE(i + 4);
+    // skip VP8X (the stills are plain VP8/VP8L; VP8X would need frame-level handling)
+    if (tag !== 'VP8X' && tag !== 'ALPH') {
+      parts.push(buf.subarray(i, i + 8 + size));
+    }
+    i += 8 + size + (size % 2);
+  }
+  if (!parts.length) throw new Error('stripWebpContainer: no image chunk');
+  return Buffer.concat(parts);
 }
 
 // ---------- Request handler ----------
@@ -386,6 +440,7 @@ if (require.main === module) {
 
 module.exports = {
   handle, main, resolveAllowed, cachePath, probeVideo, hasV4l2Decoder, pickDecoder,
-  makeImageThumb, makeVideoThumb, makeVideoPreview, makeVideoSlideshow, makeVideoMix, extractVideoFrame,
+  makeImageThumb, makeVideoThumb, makeVideoPreview, makeVideoSlideshow, makeVideoMix,
+  buildAnimatedWebP, extractVideoFrame,
   ROOTS, CACHE_DIR, TOKEN, PORT,
 };
