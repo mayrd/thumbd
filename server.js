@@ -37,8 +37,8 @@ async function resolveAllowed(absPath) {
   return null;
 }
 
-function cachePath(realPath, w, h, t) {
-  const key = crypto.createHash('sha1').update(`${realPath}|${w}|${h}|${t}`).digest('hex');
+function cachePath(realPath, w, h, t, fit) {
+  const key = crypto.createHash('sha1').update(`${realPath}|${w}|${h}|${t}|${fit}`).digest('hex');
   return path.join(CACHE_DIR, key.slice(0, 2), key + '.webp');
 }
 
@@ -88,18 +88,23 @@ function pickDecoder(codec, v4l2Available) {
 }
 
 // ---------- Thumbnail generation ----------
-async function makeImageThumb(realPath, w, h, outTmp) {
+async function makeImageThumb(realPath, w, h, outTmp, fit = 'contain') {
   const sharp = require('sharp');
+  const sharpFit = fit === 'cover' ? 'cover' : 'inside';  // cover = fill+crop, inside = contain (keep ratio)
   await sharp(realPath, { failOn: 'none', limitInputPixels: 100_000_000 })
     .rotate()                       // respect EXIF orientation
-    .resize(w, h, { fit: 'inside', withoutEnlargement: true })  // contain: keep source aspect ratio (like legacy thumbnailer)
+    .resize(w, h, { fit: sharpFit, withoutEnlargement: true })
     .webp({ quality: 80 })
     .toFile(outTmp);
 }
 
-async function makeVideoThumb(realPath, w, h, t, outTmp, decoder) {
+async function makeVideoThumb(realPath, w, h, t, outTmp, decoder, fit = 'contain') {
   const seek = Math.max(0, t);
   const decArgs = decoder ? ['-c:v', decoder] : [];   // null = software
+  // cover = scale up to fill + crop to exact box; contain = keep source ratio
+  const vf = fit === 'cover'
+    ? `scale=${w}:${h}:force_original_aspect_ratio=increase,crop=${w}:${h}`
+    : `scale=${w}:${h}:force_original_aspect_ratio=decrease`;
   await new Promise((resolve, reject) => {
     execFile(FFMPEG, [
       '-y', '-hide_banner', '-loglevel', 'error',
@@ -107,7 +112,7 @@ async function makeVideoThumb(realPath, w, h, t, outTmp, decoder) {
       ...decArgs,                          // HW decoder when suitable, otherwise software
       '-i', realPath,
       '-frames:v', '1',
-      '-vf', `scale=${w}:${h}:force_original_aspect_ratio=decrease`,  // contain: keep source aspect ratio (like legacy thumbnailer)
+      '-vf', vf,
       '-q:v', '4',
       '-f', 'webp',                        // explicit, since .tmp suffix breaks detection
       outTmp,
@@ -135,6 +140,7 @@ async function handle(req, res) {
   const w = Math.min(parseInt(u.searchParams.get('w') || '320', 10) || 320, 1024);
   const h = Math.min(parseInt(u.searchParams.get('h') || '320', 10) || 320, 1024);
   const t = Math.max(0, parseFloat(u.searchParams.get('t') || '1'));
+  const fit = u.searchParams.get('fit') === 'cover' ? 'cover' : 'contain';  // contain (keep ratio) default, cover (fill+crop) optional
   if (!p) return send(res, 400, 'missing path');
 
   // Build absolute path (only if already absolute, otherwise relative to first root)
@@ -152,7 +158,7 @@ async function handle(req, res) {
   if (!isVideo && !isImage) return send(res, 415, 'unsupported type');
 
   // Cache
-  const cp = cachePath(real, w, h, isVideo ? t : 0);
+  const cp = cachePath(real, w, h, isVideo ? t : 0, fit);
   try {
     const st = await fsp.stat(cp);
     res.writeHead(200, {
@@ -177,16 +183,16 @@ async function handle(req, res) {
       const dur = info ? info.duration : null;
       const seek = (dur !== null && t > dur) ? Math.max(0, Math.min(VIDEO_MAX_SEC, dur / 2)) : t;
       try {
-        await makeVideoThumb(real, w, h, seek, outTmp, decoder);
+        await makeVideoThumb(real, w, h, seek, outTmp, decoder, fit);
       } catch (hwErr) {
         if (decoder) {
           // HW decode failed (e.g. codec details) → software retry
           log('hw decode failed, fallback to software:', real, hwErr.message);
-          await makeVideoThumb(real, w, h, seek, outTmp, null);
+          await makeVideoThumb(real, w, h, seek, outTmp, null, fit);
         } else throw hwErr;
       }
     } else {
-      await makeImageThumb(real, w, h, outTmp);
+      await makeImageThumb(real, w, h, outTmp, fit);
     }
     await fsp.rename(outTmp, cp);
   } catch (e) {

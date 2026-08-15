@@ -193,6 +193,31 @@ test('GET /thumb image does not enlarge small sources', async () => {
   assert.equal(meta.height, 48);
 });
 
+test('GET /thumb image fit=cover fills the box (crop)', async () => {
+  // 64x48 (4:3) source, fit=cover with 32x32 box → exactly 32x32 (cropped).
+  const r = await get(`/thumb?path=${encodeURIComponent('test.png')}&w=32&h=32&fit=cover`, { 'X-Thumb-Token': 'testtoken123' });
+  assert.equal(r.status, 200);
+  const meta = await sharp(r.body).metadata();
+  assert.equal(meta.width, 32);
+  assert.equal(meta.height, 32);
+});
+
+test('GET /thumb contain and cover use separate cache entries', async () => {
+  const p = (fit) => `/thumb?path=${encodeURIComponent('test.png')}&w=40&h=40${fit ? '&fit=' + fit : ''}`;
+  const r1 = await get(p(''), { 'X-Thumb-Token': 'testtoken123' });      // contain (default)
+  const r2 = await get(p('cover'), { 'X-Thumb-Token': 'testtoken123' }); // cover
+  assert.equal(r1.status, 200);
+  assert.equal(r2.status, 200);
+  assert.equal(r1.headers['x-thumb-source'], 'generated');
+  assert.equal(r2.headers['x-thumb-source'], 'generated');
+  const m1 = await sharp(r1.body).metadata();
+  const m2 = await sharp(r2.body).metadata();
+  assert.notDeepEqual([m1.width, m1.height], [m2.width, m2.height]);
+  // cache hits must stay separate too
+  const r3 = await get(p('cover'), { 'X-Thumb-Token': 'testtoken123' });
+  assert.equal(r3.headers['x-thumb-source'], 'cache');
+});
+
 // ---------- Integration: video thumbnail ----------
 test('GET /thumb video (H.264) -> 200 WebP', async () => {
   const r = await get(`/thumb?path=${encodeURIComponent('test.mp4')}&w=100&h=100&t=0`, { 'X-Thumb-Token': 'testtoken123' });

@@ -79,8 +79,9 @@ GET /health
 | Parameter | Meaning |
 |---|---|
 | `path` | A file inside one of the configured roots (otherwise 403). Absolute, or relative to the first root. |
-| `w`, `h` | Target size (max 1024, `cover` crop, no upscaling) |
+| `w`, `h` | Target size (max 1024, no upscaling) |
 | `t` | Video timestamp in seconds (default 1; clamped for long videos) |
+| `fit` | `contain` (default — scale to fit the box, keep the source aspect ratio, no crop) or `cover` (fill the box exactly, cropping overflow). Passed through to sharp/ffmpeg. |
 
 - Auth: header `X-Thumb-Token` (only when `THUMBD_TOKEN` is set)
 - Response: `image/webp`, `Cache-Control: public, max-age=604800`, `ETag`, `X-Thumb-Source: generated|cache`
