@@ -128,7 +128,7 @@ Notes:
 
 ```bash
 npm install
-npm test          # node:test, 18 tests (unit + integration)
+npm test          # node:test, 30 tests (unit + integration)
 npm start         # run the daemon locally
 ```
 
