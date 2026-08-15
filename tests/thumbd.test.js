@@ -8,6 +8,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const http = require('node:http');
+const sharp = require('sharp');
 
 // Set env BEFORE require (constants are read at module load)
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'thumbd-test-'));
@@ -171,6 +172,25 @@ test('GET /thumb image second call -> cache', async () => {
   const r = await get(p, { 'X-Thumb-Token': 'testtoken123' });
   assert.equal(r.status, 200);
   assert.equal(r.headers['x-thumb-source'], 'cache');
+});
+
+test('GET /thumb image keeps source aspect ratio (contain, no crop)', async () => {
+  // test.png is 64x48 (4:3). Requesting 32x32 must NOT crop to 32x32,
+  // it must scale proportionally to 32x24 (like the legacy thumbnailer).
+  const r = await get(`/thumb?path=${encodeURIComponent('test.png')}&w=32&h=32`, { 'X-Thumb-Token': 'testtoken123' });
+  assert.equal(r.status, 200);
+  const meta = await sharp(r.body).metadata();
+  assert.equal(meta.width, 32);
+  assert.equal(meta.height, 24);
+});
+
+test('GET /thumb image does not enlarge small sources', async () => {
+  // 64x48 source, requesting 200x200: withoutEnlargement keeps it at 64x48.
+  const r = await get(`/thumb?path=${encodeURIComponent('test.png')}&w=200&h=200`, { 'X-Thumb-Token': 'testtoken123' });
+  assert.equal(r.status, 200);
+  const meta = await sharp(r.body).metadata();
+  assert.equal(meta.width, 64);
+  assert.equal(meta.height, 48);
 });
 
 // ---------- Integration: video thumbnail ----------

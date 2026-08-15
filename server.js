@@ -92,7 +92,7 @@ async function makeImageThumb(realPath, w, h, outTmp) {
   const sharp = require('sharp');
   await sharp(realPath, { failOn: 'none', limitInputPixels: 100_000_000 })
     .rotate()                       // respect EXIF orientation
-    .resize(w, h, { fit: 'cover', withoutEnlargement: true })
+    .resize(w, h, { fit: 'inside', withoutEnlargement: true })  // contain: keep source aspect ratio (like legacy thumbnailer)
     .webp({ quality: 80 })
     .toFile(outTmp);
 }
@@ -107,7 +107,7 @@ async function makeVideoThumb(realPath, w, h, t, outTmp, decoder) {
       ...decArgs,                          // HW decoder when suitable, otherwise software
       '-i', realPath,
       '-frames:v', '1',
-      '-vf', `scale=${w}:${h}:force_original_aspect_ratio=increase,crop=${w}:${h}`,
+      '-vf', `scale=${w}:${h}:force_original_aspect_ratio=decrease`,  // contain: keep source aspect ratio (like legacy thumbnailer)
       '-q:v', '4',
       '-f', 'webp',                        // explicit, since .tmp suffix breaks detection
       outTmp,
