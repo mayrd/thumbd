@@ -1,10 +1,10 @@
 #!/bin/sh
-# thumbd entrypoint: Cache-Volume- und v4l2-Device-Rechte sicherstellen (als root),
-# dann als node (uid 1000) starten. su-exec setzt nur uid:gid — die supplementary
-# groups (video/44) gehen dabei verloren, daher werden die Devices hier offen gelegt.
+# thumbd entrypoint: ensure cache volume + v4l2 device permissions (as root),
+# then start as node (uid 1000). su-exec only sets uid:gid — supplementary groups
+# (video/44) are lost, so the devices are opened up here instead.
 set -e
 mkdir -p /cache /data
 chown -R node:node /cache 2>/dev/null || true
-# v4l2-Hardware-Decoder fuer den node-User oeffnen (Container-lokal unkritisch)
+# Open up v4l2 HW decoders for the node user (container-local, harmless)
 chmod 666 /dev/video* /dev/media* 2>/dev/null || true
 exec su-exec node node /app/server.js

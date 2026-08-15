@@ -1,93 +1,137 @@
 # thumbd
 
-Schnelle Thumbnails für Bilder und Videos als persistenter Daemon — Ersatz für
-PHP/ImageMagick-Thumbnailer in Web-File-Managern. Läuft als Docker-Container auf
-ARM64 (Raspberry Pi 5) und amd64.
+Fast thumbnails for images and videos as a persistent daemon — a drop-in thumbnail
+generator service for your personal media server (e.g. on a Raspberry Pi). Runs as a
+Docker container on ARM64 and amd64.
 
-- **Bilder:** `sharp` (libvips) — 5–20× schneller als ImageMagick, ~1/10 RAM
-- **Videos:** `ffmpeg` mit Hardware-Decode wo verfügbar (Pi 5: HEVC via `hevc_v4l2m2m`; H.264 = Software, der Pi 5 hat keinen HW-H.264-Decoder)
-- **Architektur:** Daemon bleibt warm im Speicher — kein Prozess-Spawn pro Request
-- **Sicherheit:** Pfad-Whitelist (nur konfigurierte Roots, symlink-sicher), optionales Token, Größenlimits
-- **Cache:** Disk-Cache mit ETag + `Cache-Control: max-age=604800`
+- **Images:** `sharp` (libvips) — 5–20× faster than ImageMagick, ~1/10 the RAM
+- **Videos:** `ffmpeg` with hardware decode where available (Pi 5: HEVC via `hevc_v4l2m2m`; H.264 stays software — the Pi 5 has no HW H.264 decoder)
+- **Architecture:** the daemon stays warm in memory — no process spawn per request
+- **Security:** path whitelist (only configured roots, symlink-safe), optional token, size limits
+- **Cache:** disk cache with ETag + `Cache-Control: max-age=604800`
 
 ## Quickstart
 
-```bash
-# Docker-Image bauen + starten
-docker compose up -d --build
+Prebuilt multi-arch images are published to the GitHub Container Registry:
+`ghcr.io/mayrd/thumbd:latest` (linux/amd64 + linux/arm64).
 
-# Medien-Ordner in der docker-compose.yml unter volumes eintragen (z.B. /home/daniel:/home/daniel)
-# Test:
-curl -s -o t.webp "http://localhost:8090/thumb?path=/home/daniel/Bilder/test.jpg&w=320&h=320"
+```bash
+# Example: docker-compose.yml using the GitHub image — mount your media folder as /data
+curl -s -o docker-compose.yml https://raw.githubusercontent.com/mayrd/thumbd/main/docker-compose.yml
+docker compose up -d
+
+# Test (adjust the path to one of your media files):
+curl -s -o t.webp "http://localhost:8090/thumb?path=/home/USER/Bilder/test.jpg&w=320&h=320"
 ```
 
-Fertige Images: `ghcr.io/mayrd/thumbd:latest` (multi-arch amd64/arm64).
+Example `docker-compose.yml` (identical to the one in this repo):
+
+```yaml
+services:
+  thumbd:
+    image: ghcr.io/mayrd/thumbd:latest
+    container_name: thumbd
+    restart: unless-stopped
+    group_add:
+      - "44"                       # host group 'video' — v4l2 HW-decoder access on the Pi
+    ports:
+      - "8090:8090"
+    environment:
+      THUMBD_ROOTS: "/data"        # comma-separated roots (whitelist)
+      THUMBD_TOKEN: "${THUMBD_TOKEN:-}"   # empty = no auth (internal only!)
+    volumes:
+      - /home/USER:/home/USER      # >>> your media folders <<<
+      - thumbd-cache:/cache
+    devices:                       # Pi 5 v4l2 devices (video19-35 + media0-2)
+      - /dev/video19:/dev/video19
+      - /dev/video20:/dev/video20
+      - /dev/video21:/dev/video21
+      - /dev/video22:/dev/video22
+      - /dev/video23:/dev/video23
+      - /dev/video24:/dev/video24
+      - /dev/video25:/dev/video25
+      - /dev/video26:/dev/video26
+      - /dev/video27:/dev/video27
+      - /dev/video28:/dev/video28
+      - /dev/video29:/dev/video29
+      - /dev/video30:/dev/video30
+      - /dev/video31:/dev/video31
+      - /dev/video32:/dev/video32
+      - /dev/video33:/dev/video33
+      - /dev/video34:/dev/video34
+      - /dev/video35:/dev/video35
+      - /dev/media0:/dev/media0
+      - /dev/media1:/dev/media1
+      - /dev/media2:/dev/media2
+
+volumes:
+  thumbd-cache:
+```
 
 ## API
 
 ```
-GET /thumb?path=<absoluter Pfad>&w=320&h=320&t=1
+GET /thumb?path=<absolute path>&w=320&h=320&t=1
 GET /health
 ```
 
-| Parameter | Bedeutung |
+| Parameter | Meaning |
 |---|---|
-| `path` | Datei innerhalb eines konfigurierten Roots (sonst 403). Absolut oder relativ zum ersten Root. |
-| `w`, `h` | Zielgröße (max 1024, `cover`-Crop, ohne Vergrößerung) |
-| `t` | Video-Zeitpunkt in Sekunden (Default 1; bei langen Videos gedeckelt) |
+| `path` | A file inside one of the configured roots (otherwise 403). Absolute, or relative to the first root. |
+| `w`, `h` | Target size (max 1024, `cover` crop, no upscaling) |
+| `t` | Video timestamp in seconds (default 1; clamped for long videos) |
 
-- Auth: Header `X-Thumb-Token` (nur wenn `THUMBD_TOKEN` gesetzt)
-- Antwort: `image/webp`, `Cache-Control: public, max-age=604800`, `ETag`, `X-Thumb-Source: generated|cache`
+- Auth: header `X-Thumb-Token` (only when `THUMBD_TOKEN` is set)
+- Response: `image/webp`, `Cache-Control: public, max-age=604800`, `ETag`, `X-Thumb-Source: generated|cache`
 
-## Konfiguration (Env)
+## Configuration (env)
 
-| Variable | Default | Bedeutung |
+| Variable | Default | Meaning |
 |---|---|---|
-| `THUMBD_PORT` | `8090` | HTTP-Port |
-| `THUMBD_ROOTS` | `/data` | Komma-getrennte Wurzel-Pfade (Whitelist, symlink-sicher) |
-| `THUMBD_CACHE` | `/cache` | Disk-Cache-Verzeichnis |
-| `THUMBD_TOKEN` | *(leer)* | Request-Token; leer = kein Auth (nur hinter nginx nutzen) |
-| `THUMBD_V4L2` | `h264_v4l2m2m` | HW-Decoder-Name für die Verfügbarkeitsprüfung |
-| `THUMBD_MAX_SRC_MB` | `4096` | Max. Quelldateigröße (Serien-Episoden sind oft 1–2 GB) |
-| `THUMBD_VIDEO_MAX_SEC` | `600` | Videos >10 min: Still aus der ersten Hälfte |
+| `THUMBD_PORT` | `8090` | HTTP port |
+| `THUMBD_ROOTS` | `/data` | Comma-separated root paths (whitelist, symlink-safe) |
+| `THUMBD_CACHE` | `/cache` | Disk cache directory |
+| `THUMBD_TOKEN` | *(empty)* | Request token; empty = no auth (only use behind nginx) |
+| `THUMBD_V4L2` | `h264_v4l2m2m` | HW decoder name for the availability check |
+| `THUMBD_MAX_SRC_MB` | `4096` | Max source file size (TV episodes are often 1–2 GB) |
+| `THUMBD_VIDEO_MAX_SEC` | `600` | Videos >10 min: still from the first half |
 
-## Entwicklung
+## Development
 
 ```bash
 npm install
-npm test          # node:test, 18 Tests (Unit + Integration)
-npm start         # Daemon lokal starten
+npm test          # node:test, 18 tests (unit + integration)
+npm start         # run the daemon locally
 ```
 
-Tests decken ab: Pfad-Whitelist/`..`-Traversal, Auth (401/403), WebP-Output,
-Cache-Verhalten, Video-Thumbnails (erzeugt ein Testvideo mit ffmpeg), GET-only.
+The tests cover: path whitelist / `..` traversal, auth (401/403), WebP output,
+cache behavior, video thumbnails (generates a test video with ffmpeg), GET-only.
 
-## nginx-Anbindung
+## nginx integration
 
 ```nginx
 location /thumb/ {
     proxy_pass http://thumbd:8090/thumb/;
-    proxy_set_header X-Thumb-Token $thumbd_token;   # aus env/map
+    proxy_set_header X-Thumb-Token $thumbd_token;   # from env/map
 }
 ```
 
-Ohne `THUMBD_TOKEN` nie öffentlich exponieren — den Dienst hinter nginx
-`auth_request` betreiben (schließt zugleich das LFI-Loch eines ungeschützten
-PHP-Thumbnailers).
+Never expose the service publicly without `THUMBD_TOKEN` — run it behind nginx
+`auth_request` instead (this also closes the LFI hole of an unprotected
+PHP-style thumbnailer).
 
 ## Pitfalls
 
-- **Pi 5 hat keinen HW-H.264-Decoder** — nur HEVC (`rpi-hevc-dec`, `/dev/video19`).
-  thumbd wählt den Decoder per ffprobe: HEVC → `hevc_v4l2m2m`, sonst Software,
-  mit automatischem Software-Retry bei HW-Fehlern.
-- **v4l2-Geräte im Compose mappen** (Pi 5: `/dev/video19`–`35` + `/dev/media*`),
-  `group_add: ["44"]` = Host-Gruppe `video`.
-- **Cache-Volume gehört anfangs root** — der Entrypoint chownt `/cache` auf den
-  Container-User (root → node, uid 1000) via `su-exec`.
-- **`su-exec` setzt nur uid:gid, keine supplementary groups** — deshalb legt der
-  Entrypoint die v4l2-Devices per `chmod 666` offen statt auf Gruppen zu setzen.
-- **uid 1000 im Container = Host-User daniel** — Dateirechte auf gemappten Medien
-  stimmen ohne chmod-Aktionen.
-- **Kein `docker compose` v2 auf dem Pi-Host** — `docker-compose` (v1) verwenden.
-- Alpine-`node:20-alpine` hat bereits einen User mit uid 1000 (`node`) — nicht
-  `adduser` mit uid 1000 versuchen.
+- **Pi 5 has no HW H.264 decoder** — only HEVC (`rpi-hevc-dec`, `/dev/video19`).
+  thumbd picks the decoder via ffprobe: HEVC → `hevc_v4l2m2m`, otherwise software,
+  with an automatic software retry if the HW path fails.
+- **Map the v4l2 devices in compose** (Pi 5: `/dev/video19`–`35` + `/dev/media*`),
+  and add `group_add: ["44"]` = host group `video`.
+- **The cache volume initially belongs to root** — the entrypoint chowns `/cache`
+  to the container user (root → node, uid 1000) via `su-exec`.
+- **`su-exec` only sets uid:gid, no supplementary groups** — that is why the
+  entrypoint opens the v4l2 devices with `chmod 666` instead of relying on groups.
+- **uid 1000 in the container = your host user** — file permissions on mounted
+  media work without chmod actions.
+- Alpine's `node:20-alpine` already ships a user with uid 1000 (`node`) — do not
+  try `adduser` with uid 1000.
