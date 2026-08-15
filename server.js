@@ -121,26 +121,26 @@ async function makeVideoThumb(realPath, w, h, t, outTmp, decoder, fit = 'contain
 }
 
 // Animated preview: `mode=preview` — animated WebP from `t` for `d` seconds at `fps`
-// (matches the legacy AnimatedVideoThumbnail: -ss 1 -t 3 -vf fps=10 -loop 0)
+// (matches the legacy AnimatedVideoThumbnail: -ss 1 -t 3 -vf fps=10 -loop 0).
+// Frames are assembled in Node (buildAnimatedWebP) — ffmpeg's webp muxer (v8) uses
+// delta-frames/partial ANMF chunks with merged delays, which is inconsistent.
 async function makeVideoPreview(realPath, w, h, t, d, fps, outTmp, decoder, fit = 'contain') {
-  const decArgs = decoder ? ['-c:v', decoder] : [];
-  const vf = fit === 'cover'
-    ? `fps=${fps},scale=${w}:${h}:force_original_aspect_ratio=increase,crop=${w}:${h}`
-    : `fps=${fps},scale=${w}:${h}:force_original_aspect_ratio=decrease`;
-  await new Promise((resolve, reject) => {
-    execFile(FFMPEG, [
-      '-y', '-hide_banner', '-loglevel', 'error',
-      '-ss', String(Math.max(0, t)),
-      ...decArgs,
-      '-i', realPath,
-      '-t', String(Math.max(0.2, d)),
-      '-vf', vf,
-      '-loop', '0',
-      '-q:v', '4',
-      '-f', 'webp',
-      outTmp,
-    ], { timeout: 90000 }, (err) => err ? reject(err) : resolve());
-  });
+  const nFrames = Math.max(1, Math.round(fps * d));
+  const pFiles = [];
+  try {
+    for (let i = 0; i < nFrames; i++) {
+      const ts = Math.max(0, t + i / fps);
+      const f = `${outTmp}.p${i}`;
+      await extractVideoFrame(realPath, ts, w, h, f, decoder, fit);
+      pFiles.push(f);
+    }
+    const bufs = [];
+    for (const f of pFiles) bufs.push(await fsp.readFile(f));
+    const anim = await buildAnimatedWebP(bufs, bufs.map(() => Math.round(1000 / fps)));
+    await fsp.writeFile(outTmp, anim);
+  } finally {
+    for (const f of pFiles) await fsp.unlink(f).catch(() => {});
+  }
 }
 
 // Extract a single still frame to a file (helper for slideshow)
