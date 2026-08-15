@@ -1,63 +1,40 @@
 # thumbd — persistent thumbnail daemon
-# Example compose: map a media folder as /data and you are done.
-# Uses the prebuilt multi-arch image from the GitHub Container Registry
-# (linux/amd64 + linux/arm64). Build it yourself with `docker build` if you prefer.
+# Minimal example. Map ONE media folder as /data and you are done.
+# Uses the prebuilt multi-arch image from GitHub Container Registry (amd64 + arm64).
 
 services:
   thumbd:
     image: ghcr.io/mayrd/thumbd:latest
     container_name: thumbd
     restart: unless-stopped
-    # The uid switch is handled by the entrypoint (root → node uid 1000, so the cache
-    # volume can be chowned). Do NOT override `user:` here — that would start the
-    # entrypoint as node and the chown would fail.
-    # group_add 44 = host group 'video' (v4l2 hardware-decoder access on the Pi)
-    group_add:
-      - "44"
     ports:
-      - "8090:8090"          # use internally (auth_request) or expose on localhost only
+      - "8090:8090"          # use internally (behind nginx auth_request) or localhost only
     environment:
-      THUMBD_PORT: "8090"
-      # Comma-separated roots — everything else is rejected (path whitelist, symlink-safe)
-      THUMBD_ROOTS: "/data,/mnt/pcloud,/mnt/crypt0"
-      THUMBD_CACHE: "/cache"
+      # THUMBD_ROOTS = which paths INSIDE the container may be served (whitelist).
+      # It must match the mount below: a file is only served if it is under one of
+      # these roots. Keep it simple: mount your folder as /data and use "/data".
+      THUMBD_ROOTS: "/data"
       # Token for request auth (empty = no auth — ONLY use behind nginx auth_request!)
       THUMBD_TOKEN: "${THUMBD_TOKEN:-}"
-      # HW decoder check name (Pi 5: hevc_v4l2m2m is used automatically for HEVC;
-      # H.264 falls back to software since the Pi 5 has no HW H.264 decoder)
-      THUMBD_V4L2: "h264_v4l2m2m"
+      # The daemon drops to this uid:gid after startup (via su-exec). Set it to your
+      # HOST user's uid:gid (default 1000:1000 = typical first user on a Pi) so file
+      # permissions on the mounted media work without chmod gymnastics.
+      THUMBD_UID: "1000"
+      THUMBD_GID: "1000"
     volumes:
-      # >>> Mount your media folders here <<<
-      - /home/USER:/home/USER
-      - /mnt/pcloud:/mnt/pcloud
-      - /mnt/crypt0:/mnt/crypt0
-      - thumbd-cache:/cache
-    # HW video decode needs access to the v4l2 devices (Pi 5: pispbe video20-35,
-    # rpi-hevc-dec video19) + media controllers. Pass through all video/media devices.
-    devices:
-      - /dev/video19:/dev/video19
-      - /dev/video20:/dev/video20
-      - /dev/video21:/dev/video21
-      - /dev/video22:/dev/video22
-      - /dev/video23:/dev/video23
-      - /dev/video24:/dev/video24
-      - /dev/video25:/dev/video25
-      - /dev/video26:/dev/video26
-      - /dev/video27:/dev/video27
-      - /dev/video28:/dev/video28
-      - /dev/video29:/dev/video29
-      - /dev/video30:/dev/video30
-      - /dev/video31:/dev/video31
-      - /dev/video32:/dev/video32
-      - /dev/video33:/dev/video33
-      - /dev/video34:/dev/video34
-      - /dev/video35:/dev/video35
-      - /dev/media0:/dev/media0
-      - /dev/media1:/dev/media1
-      - /dev/media2:/dev/media2
-    # For the HW decoder (DMA-BUF/media controller) if needed:
-    #cap_add:
-    #  - SYS_ADMIN        # only if v4l2 decode causes problems in the container
+      # >>> Your media folder, mounted read-only (thumbd never writes to sources) <<<
+      - /home/USER:/data:ro
+      - thumbd-cache:/cache   # thumbnail cache (writable)
+
+    # --- OPTIONAL: hardware video decode (Raspberry Pi 5, HEVC only) ---
+    # Without this, videos are decoded in software — works everywhere, a bit slower.
+    # The Pi 5 has no HW H.264 decoder, so H.264 is always software regardless.
+    # Only add these lines if you decode HEVC content on a Pi 5:
+    # group_add:
+    #   - "44"                        # host group 'video'
+    # devices:
+    #   - /dev/video19:/dev/video19  # rpi-hevc-dec (HEVC decoder)
+    #   - /dev/media0:/dev/media0    # media controller for the decoder
 
 volumes:
   thumbd-cache:
