@@ -5,7 +5,7 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "test": "node --test \"tests/**/*.test.js\""
+    "test": "node --test tests/thumbd.test.js"
   },
   "dependencies": {
     "sharp": "^0.33.5"
