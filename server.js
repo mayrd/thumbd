@@ -198,6 +198,49 @@ async function makeVideoSlideshow(realPath, w, h, times, outTmp, decoder, fit = 
   }
 }
 
+// Mix: `mode=mix` — animated preview (t..t+d at fps) followed by a slideshow of the
+// remaining video (count evenly spaced frames, or one frame every interval seconds).
+// Preview frames are shown at 1/fps s each, slideshow frames for 1 s each.
+async function makeVideoMix(realPath, w, h, t, d, fps, times, outTmp, decoder, fit = 'contain') {
+  const frames = [];   // {path, dur}
+  try {
+    // 1) preview frames: fps*d frames from t..t+d, each displayed 1/fps s
+    const nPrev = Math.max(1, Math.round(fps * d));
+    for (let i = 0; i < nPrev; i++) {
+      const ts = Math.max(0, t + i / fps);
+      const f = `${outTmp}.p${i}`;
+      await extractVideoFrame(realPath, ts, w, h, f, decoder, fit);
+      frames.push({ path: f, dur: 1 / fps });
+    }
+    // 2) slideshow frames of the remaining video, each displayed 1 s
+    for (let i = 0; i < times.length; i++) {
+      const f = `${outTmp}.s${i}`;
+      await extractVideoFrame(realPath, times[i], w, h, f, decoder, fit);
+      frames.push({ path: f, dur: 1 });
+    }
+    // 3) concat all frames into one animated WebP with per-frame durations
+    const inputs = [];
+    const filterParts = [];
+    frames.forEach((fr, i) => {
+      inputs.push('-loop', '1', '-t', String(fr.dur), '-i', fr.path);
+      filterParts.push(`[${i}:v]`);
+    });
+    await new Promise((resolve, reject) => {
+      execFile(FFMPEG, [
+        '-y', '-hide_banner', '-loglevel', 'error',
+        ...inputs,
+        '-filter_complex', `${filterParts.join('')}concat=n=${frames.length}:v=1`,
+        '-loop', '0',
+        '-q:v', '4',
+        '-f', 'webp',
+        outTmp,
+      ], { timeout: 120000 }, (err) => err ? reject(err) : resolve());
+    });
+  } finally {
+    for (const fr of frames) await fsp.unlink(fr.path).catch(() => {});
+  }
+}
+
 // ---------- Request handler ----------
 async function handle(req, res) {
   if (req.method !== 'GET') return send(res, 405, 'method not allowed (only GET)');
@@ -275,19 +318,26 @@ async function handle(req, res) {
       const generate = async (dec) => {
         if (mode === 'preview') {
           await makeVideoPreview(real, w, h, seek, d, fps, outTmp, dec, fit);
-        } else if (mode === 'slideshow') {
+        } else if (mode === 'slideshow' || mode === 'mix') {
           // build the frame timestamps: interval (every N s) or count (N evenly spaced)
           let times;
-          if (!dur) throw new Error('slideshow needs a probeable video duration');
+          if (!dur) throw new Error(`${mode} needs a probeable video duration`);
+          // mix: slideshow covers only the video AFTER the preview window (t+d)
+          const restStart = mode === 'mix' ? Math.min(seek + d, dur) : 0;
+          const restLen = Math.max(0, dur - restStart);
           if (interval > 0) {
             times = [];
-            for (let ts = interval; ts < dur && times.length < 60; ts += interval) times.push(ts);
-            if (!times.length) times = [Math.max(0.5, dur / 2)];
+            for (let ts = restStart + interval; ts < dur && times.length < 60; ts += interval) times.push(ts);
+            if (!times.length) times = [Math.max(restStart + 0.5, dur / 2)];
           } else {
             times = [];
-            for (let i = 1; i <= count; i++) times.push(dur * i / (count + 1));
+            for (let i = 1; i <= count; i++) times.push(restStart + restLen * i / (count + 1));
           }
-          await makeVideoSlideshow(real, w, h, times, outTmp, dec, fit);
+          if (mode === 'mix') {
+            await makeVideoMix(real, w, h, seek, d, fps, times, outTmp, dec, fit);
+          } else {
+            await makeVideoSlideshow(real, w, h, times, outTmp, dec, fit);
+          }
         } else {
           await makeVideoThumb(real, w, h, seek, outTmp, dec, fit);
         }
@@ -336,6 +386,6 @@ if (require.main === module) {
 
 module.exports = {
   handle, main, resolveAllowed, cachePath, probeVideo, hasV4l2Decoder, pickDecoder,
-  makeImageThumb, makeVideoThumb, makeVideoPreview, makeVideoSlideshow, extractVideoFrame,
+  makeImageThumb, makeVideoThumb, makeVideoPreview, makeVideoSlideshow, makeVideoMix, extractVideoFrame,
   ROOTS, CACHE_DIR, TOKEN, PORT,
 };

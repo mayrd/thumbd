@@ -269,6 +269,26 @@ test('GET /thumb video mode=slideshow interval=4 -> animated WebP', async () => 
   assert.ok(meta.pages > 1, `expected animated webp, got pages=${meta.pages}`);
 });
 
+test('GET /thumb video mode=mix -> animated WebP (preview + slideshow)', async () => {
+  // 12s video, defaults t=1 d=3 fps=10 count=3:
+  // preview = 30 frames (1s..4s at 10fps), slideshow = 3 frames over the rest (4s..12s)
+  const r = await get(`/thumb?path=${encodeURIComponent('test.mp4')}&w=100&h=100&mode=mix`, { 'X-Thumb-Token': 'testtoken123' });
+  assert.equal(r.status, 200, r.body.toString().slice(0, 200));
+  assert.equal(r.headers['content-type'], 'image/webp');
+  const meta = await sharp(r.body).metadata();
+  assert.ok(meta.pages > 1, `expected animated webp, got pages=${meta.pages}`);
+  // 30 preview + 3 slideshow = 33 frames (allow ffmpeg rounding ±2)
+  assert.ok(meta.pages >= 31 && meta.pages <= 35, `expected ~33 frames, got pages=${meta.pages}`);
+});
+
+test('GET /thumb video mode=mix custom params -> animated WebP', async () => {
+  // custom: preview t=0 d=2 fps=5 (10 frames), slideshow count=2 over the rest
+  const r = await get(`/thumb?path=${encodeURIComponent('test.mp4')}&w=100&h=100&mode=mix&t=0&d=2&fps=5&count=2`, { 'X-Thumb-Token': 'testtoken123' });
+  assert.equal(r.status, 200, r.body.toString().slice(0, 200));
+  const meta = await sharp(r.body).metadata();
+  assert.ok(meta.pages >= 11 && meta.pages <= 13, `expected ~12 frames, got pages=${meta.pages}`);
+});
+
 test('GET /thumb video modes have separate cache entries', async () => {
   const p = (extra) => `/thumb?path=${encodeURIComponent('test.mp4')}&w=60&h=60${extra}`;
   const r1 = await get(p(''), { 'X-Thumb-Token': 'testtoken123' });                                  // still
