@@ -234,6 +234,33 @@ test('GET /thumb image fit=cover fills the box (crop)', async () => {
   assert.equal(meta.height, 32);
 });
 
+test('GET /thumb BMP -> 200 WebP via ffmpeg fallback', async () => {
+  // sharp/libvips in this image is built WITHOUT bmp support ("Input file
+  // contains unsupported image format") — the BMP fallback decodes via ffmpeg
+  // (which has a BMP decoder). Regression for the 2026-08-16 xplorer error
+  // "thumb failed ... r_20260816_23.19.03_70%.bmp".
+  const bmpPath = path.join(ROOT, 'test.bmp');
+  await new Promise((resolve, reject) => {
+    const { execFile } = require('node:child_process');
+    execFile('ffmpeg', [
+      '-y', '-hide_banner', '-loglevel', 'error',
+      '-f', 'lavfi', '-i', 'color=c=red:s=64x48',
+      '-frames:v', '1',
+      bmpPath,
+    ], { timeout: 30000 }, (err) => err ? reject(err) : resolve());
+  });
+  const r = await get(`/thumb?path=${encodeURIComponent('test.bmp')}&w=100&h=100`, { 'X-Thumb-Token': 'testtoken123' });
+  assert.equal(r.status, 200);
+  assert.equal(r.headers['content-type'], 'image/webp');
+  assert.equal(r.body.subarray(0, 4).toString(), 'RIFF');
+  assert.equal(r.body.subarray(8, 12).toString(), 'WEBP');
+  const meta = await sharp(r.body).metadata();
+  assert.equal(meta.format, 'webp');
+  assert.equal(meta.width, 100);  // 64x48 upscaled? No — withoutEnlargement applies in sharp only;
+  // the ffmpeg path scales to fit the box (contain): 100x100 box, 64x48 source → 100x75.
+  assert.equal(meta.height, 75);
+});
+
 test('GET /thumb contain and cover use separate cache entries', async () => {
   const p = (fit) => `/thumb?path=${encodeURIComponent('test.png')}&w=40&h=40${fit ? '&fit=' + fit : ''}`;
   const r1 = await get(p(''), { 'X-Thumb-Token': 'testtoken123' });      // contain (default)

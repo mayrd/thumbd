@@ -102,11 +102,34 @@ function pickDecoder(codec, v4l2Available) {
 async function makeImageThumb(realPath, w, h, outTmp, fit = 'contain') {
   const sharp = require('sharp');
   const sharpFit = fit === 'cover' ? 'cover' : 'inside';  // cover = fill+crop, inside = contain (keep ratio)
-  await sharp(realPath, { failOn: 'none', limitInputPixels: 100_000_000 })
-    .rotate()                       // respect EXIF orientation
-    .resize(w, h, { fit: sharpFit, withoutEnlargement: true })
-    .webp({ quality: 80 })
-    .toFile(outTmp);
+  const vf = fit === 'cover'
+    ? `scale=${w}:${h}:force_original_aspect_ratio=increase,crop=${w}:${h}`
+    : `scale=${w}:${h}:force_original_aspect_ratio=decrease`;
+  try {
+    await sharp(realPath, { failOn: 'none', limitInputPixels: 100_000_000 })
+      .rotate()                       // respect EXIF orientation
+      .resize(w, h, { fit: sharpFit, withoutEnlargement: true })
+      .webp({ quality: 80 })
+      .toFile(outTmp);
+  } catch (err) {
+    // sharp/libvips is built WITHOUT bmp (and without ImageMagick) support —
+    // BMP files fail with "Input file contains unsupported image format".
+    // ffmpeg has a BMP decoder, so fall back to ffmpeg for image formats
+    // sharp cannot read. The explicit -f webp is required (.tmp suffix).
+    const ext = path.extname(realPath).toLowerCase();
+    if (ext !== '.bmp') throw err;
+    await new Promise((resolve, reject) => {
+      execFile(FFMPEG, [
+        '-y', '-hide_banner', '-loglevel', 'error',
+        '-i', realPath,
+        '-frames:v', '1',
+        '-vf', vf,
+        '-q:v', '4',
+        '-f', 'webp',
+        outTmp,
+      ], { timeout: 60000 }, (e) => e ? reject(e) : resolve());
+    });
+  }
 }
 
 async function makeVideoThumb(realPath, w, h, t, outTmp, decoder, fit = 'contain') {
