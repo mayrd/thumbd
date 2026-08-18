@@ -448,7 +448,10 @@ async function handle(req, res) {
     if (isVideo) {
       // Video generation is heavy (mix = 30+ ffmpeg calls) — run it through the
       // concurrency limiter so N parallel requests don't spawn N*30 processes.
-      await withJobLock(async () => {
+      // mode=still is ONE cheap ffmpeg call (~0.5s): it bypasses the queue so a
+      // cold grid fills instantly with stills while the animated mixes queue up
+      // behind them (progressive thumbnail UX — see xplorer thumb-progressive.js).
+      const run = async () => {
         const info = await probeVideo(real);
         const v4l2 = await hasV4l2Decoder(V4L2).catch(() => false);
         const decoder = pickDecoder(info ? info.codec : null, v4l2);
@@ -501,7 +504,12 @@ async function handle(req, res) {
           await generate(null);
         } else throw hwErr;
       }
-      }); // end withJobLock
+      };
+      if (mode === 'still') {
+        await run();  // cheap single ffmpeg call — no queue, grid fills instantly
+      } else {
+        await withJobLock(run);  // preview/slideshow/mix are heavy — serialize
+      }
     } else {
       await makeImageThumb(real, w, h, outTmp, fit);
     }
