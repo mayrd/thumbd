@@ -28,6 +28,7 @@ let baseUrl;
 let testImage;   // test image path inside the root
 let testVideo;   // test video path inside the root
 let shortVideo;  // SHORT video (2s) — regression: mix/preview used to seek past the end → 500
+let rotatedVideo; // video with a 90° display matrix (phone-style portrait recording)
 
 before(async () => {
   // Generate a test image (sharp) — small red PNG
@@ -61,6 +62,26 @@ before(async () => {
       '-t', '2', '-c:v', 'libx264', '-pix_fmt', 'yuv420p',
       shortVideo,
     ], { timeout: 90000 }, (err) => err ? reject(err) : resolve());
+  });
+
+  // Video with a 90° display matrix: stored landscape, displayed portrait —
+  // exactly what phones produce. `-display_rotation` needs ffmpeg >= 6; older
+  // builds ignore/refuse it, so the fixture falls back to a plain copy (the
+  // /dimensions test then asserts the unrotated case).
+  const { execFile } = require('node:child_process');
+  rotatedVideo = path.join(ROOT, 'rotated.mp4');
+  await new Promise((resolve) => {
+    execFile('ffmpeg', [
+      '-y', '-hide_banner', '-loglevel', 'error',
+      '-display_rotation', '90', '-i', testVideo, '-t', '2', '-c', 'copy',
+      rotatedVideo,
+    ], { timeout: 90000 }, (err) => {
+      if (!err) return resolve();
+      execFile('ffmpeg', [
+        '-y', '-hide_banner', '-loglevel', 'error', '-i', testVideo, '-t', '2',
+        '-c', 'copy', rotatedVideo,
+      ], { timeout: 90000 }, () => resolve());
+    });
   });
 
   // Start the server (port 0 = ephemeral)
@@ -97,6 +118,26 @@ function post(p, headers = {}) {
     });
     req.on('error', (e) => resolve({ status: 0, error: e.message, body: Buffer.alloc(0) }));
     req.end();
+  });
+}
+
+// ffprobe rotation read — decides whether the rotated fixture really carries a
+// display matrix (ffmpeg < 6 cannot write one, then the test asserts the
+// unrotated case instead of failing).
+function probeRotation(file) {
+  return new Promise((resolve) => {
+    const { execFile } = require('node:child_process');
+    execFile('ffprobe', ['-v', 'error', '-select_streams', 'v:0',
+      '-show_entries', 'stream_side_data=rotation', '-of', 'json', file],
+      { timeout: 15000 }, (err, stdout) => {
+        if (err) return resolve(0);
+        try {
+          const d = JSON.parse(stdout);
+          const sd = (d.streams && d.streams[0] && d.streams[0].side_data_list) || [];
+          const r = sd.length ? parseFloat(sd[0].rotation) : 0;
+          resolve(Number.isFinite(r) ? ((Math.round(r) % 360) + 360) % 360 : 0);
+        } catch { resolve(0); }
+      });
   });
 }
 
@@ -318,6 +359,48 @@ test('GET /duration missing path -> 400, outside root -> 403', async () => {
   const r1 = await get('/duration', { 'X-Thumb-Token': 'testtoken123' });
   assert.equal(r1.status, 400);
   const r2 = await get(`/duration?path=${encodeURIComponent('/etc/passwd')}`, { 'X-Thumb-Token': 'testtoken123' });
+  assert.equal(r2.status, 403);
+});
+
+// ---------- Integration: /dimensions (media-wall tile shape) ----------
+test('GET /dimensions video -> JSON with display width/height', async () => {
+  const r = await get(`/dimensions?path=${encodeURIComponent('test.mp4')}`, { 'X-Thumb-Token': 'testtoken123' });
+  assert.equal(r.status, 200, r.body.toString().slice(0, 200));
+  assert.match(r.headers['content-type'], /application\/json/);
+  const body = JSON.parse(r.body.toString());
+  assert.equal(body.width, 64);          // fixture is 64x48 landscape
+  assert.equal(body.height, 48);
+  assert.equal(body.rotation, 0);
+  // second call served from cache
+  const r2 = await get(`/dimensions?path=${encodeURIComponent('test.mp4')}`, { 'X-Thumb-Token': 'testtoken123' });
+  assert.equal(r2.status, 200);
+  assert.deepEqual(JSON.parse(r2.body.toString()), body);
+});
+
+test('GET /dimensions rotated video -> display dimensions (portrait)', async () => {
+  // Stored landscape + 90° display matrix = displayed portrait. ffprobe reports
+  // the raw sensor size, so the endpoint must swap the axes — otherwise the
+  // media wall would give a phone portrait video a wide landscape tile.
+  const rotation = await probeRotation(rotatedVideo);
+  const r = await get(`/dimensions?path=${encodeURIComponent('rotated.mp4')}`, { 'X-Thumb-Token': 'testtoken123' });
+  assert.equal(r.status, 200, r.body.toString().slice(0, 200));
+  const body = JSON.parse(r.body.toString());
+  if (rotation === 0) {
+    // Old ffmpeg (< 6) cannot write the fixture matrix → unrotated case.
+    assert.equal(body.rotation, 0);
+    assert.equal(body.width, 64);
+    assert.equal(body.height, 48);
+    return;
+  }
+  assert.equal(body.rotation, 90);
+  assert.equal(body.width, 48, 'display width must be the swapped (portrait) width');
+  assert.equal(body.height, 64, 'display height must be the swapped (portrait) height');
+});
+
+test('GET /dimensions missing path -> 400, outside root -> 403', async () => {
+  const r1 = await get('/dimensions', { 'X-Thumb-Token': 'testtoken123' });
+  assert.equal(r1.status, 400);
+  const r2 = await get(`/dimensions?path=${encodeURIComponent('/etc/passwd')}`, { 'X-Thumb-Token': 'testtoken123' });
   assert.equal(r2.status, 403);
 });
 

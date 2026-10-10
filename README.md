@@ -76,8 +76,23 @@ file permissions on the mounted media folders work without chmod gymnastics.
 
 ```
 GET /thumb?path=<absolute path>&w=320&h=320&t=1
+GET /duration?path=<absolute path>     -> {"duration": 12.34}
+GET /dimensions?path=<absolute path>   -> {"width": 1080, "height": 1920, "rotation": 90}
 GET /health
 ```
+
+### Metadata endpoints
+
+Both take the same `path` rules and `X-Thumb-Token` auth as `/thumb`, answer JSON and are
+cached forever (duration/dimensions of a file never change):
+
+- **`/duration`** — video length in seconds (`0` when not probeable). Lets the app container
+  stay slim: thumbd owns ffprobe.
+- **`/dimensions`** — **display** dimensions of a video plus its rotation. ffprobe reports the
+  raw sensor size, while ffmpeg auto-rotates on playback; phone recordings are stored landscape
+  with a 90°/270° display matrix, so the axes are swapped here. That is what a tile layout needs
+  to give a portrait video a portrait tile. `0/0` when the file is not probeable (and then
+  nothing is cached, so a later retry can still succeed).
 
 | Parameter | Meaning |
 |---|---|

@@ -49,19 +49,38 @@ function send(res, code, body, headers = {}) {
   res.end(body);
 }
 
-// ---------- Video: codec + duration + HW-decode check ----------
+// ---------- Video: codec + duration + display dimensions + HW-decode check ----------
 function probeVideo(realPath) {
-  // returns {codec, duration} or null
+  // returns {codec, duration, width, height, rotation} or null.
+  // width/height are the DISPLAY dimensions: ffprobe reports the raw sensor size,
+  // while ffmpeg auto-rotates on playback. A 90/270 display matrix (phone
+  // recordings are stored landscape) is therefore applied here — otherwise a
+  // portrait video would be reported as landscape and the media wall would pick
+  // the wrong tile shape.
   return new Promise((resolve) => {
     execFile(FFPROBE, ['-v', 'error', '-select_streams', 'v:0',
-      '-show_entries', 'stream=codec_name:format=duration',
+      '-show_entries',
+      'stream=codec_name,width,height:stream_side_data=rotation:format=duration',
       '-of', 'json', realPath], { timeout: 15000 }, (err, stdout) => {
       if (err) return resolve(null);
       try {
         const d = JSON.parse(stdout);
-        const codec = d.streams && d.streams[0] ? d.streams[0].codec_name : null;
+        const s = (d.streams && d.streams[0]) || {};
+        const codec = s.codec_name || null;
         const dur = d.format && d.format.duration ? parseFloat(d.format.duration) : null;
-        resolve({ codec, duration: Number.isFinite(dur) ? dur : null });
+        let width = Number.isFinite(s.width) ? s.width : null;
+        let height = Number.isFinite(s.height) ? s.height : null;
+        let rotation = 0;
+        const sd = Array.isArray(s.side_data_list) ? s.side_data_list : [];
+        for (const e of sd) {
+          const r = parseFloat(e.rotation);
+          if (Number.isFinite(r)) { rotation = ((Math.round(r) % 360) + 360) % 360; break; }
+        }
+        if ((rotation === 90 || rotation === 270) && width && height) {
+          const tmp = width; width = height; height = tmp;
+        }
+        resolve({ codec, duration: Number.isFinite(dur) ? dur : null,
+                  width, height, rotation });
       } catch { resolve(null); }
     });
   });
@@ -391,6 +410,36 @@ async function handle(req, res) {
     await fsp.mkdir(path.dirname(dFile), { recursive: true }).catch(() => {});
     await fsp.writeFile(dFile, body).catch(() => {});
     return send(res, 200, body, { 'Content-Type': 'application/json', 'Cache-Control': 'public, max-age=604800' });
+  }
+  // Display dimensions: GET /dimensions?path=<abs> -> JSON
+  //   {"width":1080,"height":1920,"rotation":90}
+  // Used by xplorer to pick the media-wall tile shape (portrait -> tall tile).
+  // width/height are display dimensions (rotation applied); 0/0 when the file is
+  // not probeable. Nothing is cached in that case, so a later retry can succeed.
+  if (u.pathname === '/dimensions') {
+    const mp = u.searchParams.get('path');
+    if (!mp) return send(res, 400, 'missing path');
+    const mAbs = path.isAbsolute(mp) ? mp : path.join(ROOTS[0], mp);
+    const mReal = await resolveAllowed(mAbs);
+    if (!mReal) return send(res, 403, 'path not allowed or not found');
+    const mKey = crypto.createHash('sha1').update(`dimensions|${mReal}`).digest('hex');
+    const mFile = path.join(CACHE_DIR, mKey.slice(0, 2), mKey + '.json');
+    try {
+      const cached = await fsp.readFile(mFile, 'utf8');
+      return send(res, 200, cached, { 'Content-Type': 'application/json', 'Cache-Control': 'public, max-age=604800' });
+    } catch { /* cache miss */ }
+    const mInfo = await probeVideo(mReal);
+    const mBody = JSON.stringify({
+      width: (mInfo && mInfo.width) || 0,
+      height: (mInfo && mInfo.height) || 0,
+      rotation: (mInfo && mInfo.rotation) || 0,
+    });
+    if (mInfo && mInfo.width && mInfo.height) {
+      // dimensions of a file never change → cache only real results
+      await fsp.mkdir(path.dirname(mFile), { recursive: true }).catch(() => {});
+      await fsp.writeFile(mFile, mBody).catch(() => {});
+    }
+    return send(res, 200, mBody, { 'Content-Type': 'application/json', 'Cache-Control': 'public, max-age=604800' });
   }
   if (u.pathname !== '/thumb') return send(res, 404, 'not found: use /thumb?path=...&w=...&h=...&t=...');
 
