@@ -86,6 +86,44 @@ function probeVideo(realPath) {
   });
 }
 
+// ---------- Image: display dimensions incl. EXIF orientation ----------
+// sharp reads only the header (no full decode), so this is cheap even on slow
+// mounts, and it reports orientation 1-8. Same rule as xplorer's local path:
+// orientation 5-8 means rotated 90/270 -> swap the axes, so the tile shape
+// matches what the browser shows. ffprobe is NOT usable for this: it does not
+// report a JPEG's EXIF orientation and its process start is too slow for
+// per-item calls.
+function probeImageDimensions(realPath) {
+  return new Promise((resolve) => {
+    let sharp;
+    try {
+      sharp = require('sharp');
+    } catch {
+      return resolve(null);            // no sharp -> caller falls back to its own path
+    }
+    sharp(realPath).metadata().then((m) => {
+      if (!m || !m.width || !m.height) return resolve(null);
+      const ori = Number(m.orientation) || 1;
+      const swap = ori >= 5 && ori <= 8;
+      resolve({
+        width: swap ? m.height : m.width,
+        height: swap ? m.width : m.height,
+        rotation: swap ? 90 : 0,
+      });
+    }).catch(() => resolve(null));
+  });
+}
+
+const IMAGE_EXT = new Set(['.jpg', '.jpeg', '.png', '.webp', '.gif', '.bmp',
+                           '.tif', '.tiff', '.avif', '.heic']);
+
+// Videos -> ffprobe (display matrix), images -> sharp (EXIF orientation).
+function probeMediaDimensions(realPath) {
+  return IMAGE_EXT.has(path.extname(realPath).toLowerCase())
+    ? probeImageDimensions(realPath)
+    : probeVideo(realPath);
+}
+
 function hasV4l2Decoder(decoder) {
   return new Promise((resolve) => {
     // HW decode needs real /dev/video* devices in the container (Pi 5: video19+)
@@ -428,7 +466,7 @@ async function handle(req, res) {
       const cached = await fsp.readFile(mFile, 'utf8');
       return send(res, 200, cached, { 'Content-Type': 'application/json', 'Cache-Control': 'public, max-age=604800' });
     } catch { /* cache miss */ }
-    const mInfo = await probeVideo(mReal);
+    const mInfo = await probeMediaDimensions(mReal);
     const mBody = JSON.stringify({
       width: (mInfo && mInfo.width) || 0,
       height: (mInfo && mInfo.height) || 0,
