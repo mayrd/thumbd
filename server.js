@@ -600,7 +600,27 @@ async function handle(req, res) {
     } else {
       await makeImageThumb(real, w, h, outTmp, fit);
     }
-    await fsp.rename(outTmp, cp);
+    // Retry rename if directory was removed between mkdir and rename
+    let renamed = false;
+    for (let attempt = 0; attempt < 3 && !renamed; attempt++) {
+      try {
+        await fsp.rename(outTmp, cp);
+        renamed = true;
+      } catch (renameErr) {
+        if (renameErr.code === 'ENOENT') {
+          // Directory may have been removed; recreate and retry
+          await fsp.mkdir(path.dirname(cp), { recursive: true });
+          continue;
+        }
+        throw renameErr;
+      }
+    }
+    if (!renamed) {
+      // Final attempt failed after retries
+      await fsp.unlink(outTmp).catch(() => {});
+      log('thumb failed', real, 'rename failed after 3 attempts');
+      return send(res, 500, 'thumbnail failed: rename failed');
+    }
   } catch (e) {
     await fsp.unlink(outTmp).catch(() => {});
     log('thumb failed', real, e.message);
