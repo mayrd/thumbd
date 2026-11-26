@@ -5,6 +5,7 @@
 const http = require('http');
 const fs = require('fs');
 const fsp = fs.promises;
+const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
 const { execFile } = require('child_process');
@@ -25,8 +26,58 @@ const V4L2 = process.env.THUMBD_V4L2 || 'drm';            // HW accel: 'drm' = s
 const IMAGE_EXTS = new Set(['.jpg', '.jpeg', '.png', '.webp', '.gif', '.avif', '.tif', '.tiff', '.bmp']);
 const VIDEO_EXTS = new Set(['.mp4', '.mov', '.mpg', '.mpeg', '.avi', '.flv', '.wmv', '.asf', '.mkv', '.webm', '.m4v', '.ts']);
 
+const LOG_LEVEL_MAP = {
+  off: 0, '0': 0,
+  error: 1, '1': 1,
+  warn: 2, warning: 2, '2': 2,
+  info: 3, '3': 3,
+  debug: 4, all: 4, '4': 4,
+};
+const LOG_LEVEL_NAMES = ['off', 'error', 'warn', 'info', 'debug'];
+
+function parseLogLevel(raw) {
+  const s = String(raw ?? '').trim().toLowerCase();
+  if (s === '') return 3; // info
+  return Object.prototype.hasOwnProperty.call(LOG_LEVEL_MAP, s) ? LOG_LEVEL_MAP[s] : 3;
+}
+
+function levelName(lvl) {
+  return LOG_LEVEL_NAMES[lvl] || 'info';
+}
+
+let logLevel = parseLogLevel(process.env.THUMBD_LOG_LEVEL);
+function setLogLevel(lvl) {
+  if (typeof lvl === 'string') {
+    logLevel = parseLogLevel(lvl);
+  } else if (Number.isFinite(lvl)) {
+    logLevel = Math.max(0, Math.min(4, Math.trunc(lvl)));
+  }
+  return logLevel;
+}
+function getLogLevel() { return logLevel; }
+
+const STATS_INTERVAL_SEC = (() => {
+  const raw = (process.env.THUMBD_STATS_INTERVAL_SEC ?? '').trim();
+  if (raw === '') return 30;
+  const n = parseInt(raw, 10);
+  return Number.isFinite(n) && n >= 0 ? n : 30;
+})();
+
 // ---------- Helpers ----------
-function log(...a) { console.log(new Date().toISOString(), ...a); }
+function logAt(levelNum, tag, ...a) {
+  if (logLevel >= levelNum) {
+    console.log(new Date().toISOString(), tag, ...a);
+  }
+}
+function logError(...a) { logAt(1, 'ERROR', ...a); }
+function logWarn(...a) { logAt(2, 'WARN', ...a); }
+function logInfo(...a) { logAt(3, 'INFO', ...a); }
+function logDebug(...a) { logAt(4, 'DEBUG', ...a); }
+function log(...a) { logInfo(...a); }
+
+function safeVal(v) {
+  return String(v ?? '-').replace(/[\r\n]+/g, ' ');
+}
 
 // Is the path inside one of the roots? (symlink-safe via realpath)
 async function resolveAllowed(absPath) {
@@ -168,6 +219,7 @@ async function makeImageThumb(realPath, w, h, outTmp, fit = 'contain') {
       .resize(w, h, { fit: sharpFit, withoutEnlargement: true })
       .webp({ quality: 80 })
       .toFile(outTmp);
+    return 'sharp';
   } catch (err) {
     // sharp/libvips is built WITHOUT bmp (and without ImageMagick) support —
     // BMP files fail with "Input file contains unsupported image format".
@@ -186,6 +238,7 @@ async function makeImageThumb(realPath, w, h, outTmp, fit = 'contain') {
         outTmp,
       ], { timeout: 60000 }, (e) => e ? reject(e) : resolve());
     });
+    return 'ffmpeg-bmp';
   }
 }
 
@@ -386,18 +439,115 @@ function stripWebpContainer(buf) {
   return Buffer.concat(parts);
 }
 
-// ---------- Concurrency limiter ----------
+// ---------- Concurrency limiter & metrics ----------
 // 20 parallel mode=mix requests would spawn 600+ ffmpeg processes on a Pi 5 and
 // time everything out. Serialize video generation: MAX_JOBS ffmpeg jobs run in
 // parallel, the rest wait in a FIFO queue. Images are cheap — they bypass it.
 const MAX_JOBS = Math.max(1, parseInt(process.env.THUMBD_MAX_JOBS || '2', 10));
 let activeJobs = 0;
 const jobQueue = [];
+let inFlight = 0;
+let activeImages = 0;
+let activeVideoStill = 0;
+let activeProbes = 0;
 
-function withJobLock(fn) {
+function makeEmptyStats() {
+  return {
+    reqs: 0,
+    thumbHit: 0,
+    thumbGenImg: 0,
+    thumbGenStill: 0,
+    thumbGenAnim: 0,
+    probeHit: 0,
+    probeMiss: 0,
+    errors: 0,
+    aborted: 0,
+    peakInFlight: 0,
+    peakImg: 0,
+    peakStill: 0,
+    peakJobs: 0,
+    peakQueue: 0,
+    peakProbes: 0,
+    genCount: 0,
+    genTotalMs: 0,
+    maxGenMs: 0,
+    maxWaitMs: 0,
+  };
+}
+
+let stats = makeEmptyStats();
+
+function bumpPeak(key, val) {
+  if (val > stats[key]) stats[key] = val;
+}
+
+function getStatsSnapshot() {
+  return {
+    ...stats,
+    inFlight,
+    activeImages,
+    activeVideoStill,
+    activeJobs,
+    queueLen: jobQueue.length,
+    activeProbes,
+    maxJobs: MAX_JOBS,
+  };
+}
+
+function resetStats() {
+  const snap = getStatsSnapshot();
+  stats = makeEmptyStats();
+  // Seed peaks with currently active gauges so an ongoing request is reflected in the next window.
+  stats.peakInFlight = inFlight;
+  stats.peakImg = activeImages;
+  stats.peakStill = activeVideoStill;
+  stats.peakJobs = activeJobs;
+  stats.peakQueue = jobQueue.length;
+  stats.peakProbes = activeProbes;
+  return snap;
+}
+
+function formatStatsLine(snap, windowSec) {
+  const genTotal = snap.thumbGenImg + snap.thumbGenStill + snap.thumbGenAnim;
+  const avgGenMs = snap.genCount > 0 ? Math.round(snap.genTotalMs / snap.genCount) : 0;
+  const load1m = os.loadavg()[0].toFixed(2);
+  const mem = process.memoryUsage();
+  const rssMb = Math.round(mem.rss / (1024 * 1024));
+  const heapMb = Math.round(mem.heapUsed / (1024 * 1024));
+  return (
+    `stats window=${windowSec}s reqs=${snap.reqs} thumb_hit=${snap.thumbHit} ` +
+    `thumb_gen=${genTotal}(img=${snap.thumbGenImg},still=${snap.thumbGenStill},anim=${snap.thumbGenAnim}) ` +
+    `probe_hit=${snap.probeHit} probe_miss=${snap.probeMiss} err=${snap.errors} aborted=${snap.aborted} ` +
+    `peak_inflight=${snap.peakInFlight} peak_img=${snap.peakImg} peak_still=${snap.peakStill} ` +
+    `peak_jobs=${snap.peakJobs}/${snap.maxJobs} peak_queue=${snap.peakQueue} peak_probes=${snap.peakProbes} ` +
+    `avg_gen_ms=${avgGenMs} max_gen_ms=${snap.maxGenMs} max_wait_ms=${snap.maxWaitMs} ` +
+    `load1m=${load1m} rss_mb=${rssMb} heap_mb=${heapMb}`
+  );
+}
+
+function startStatsReporter(intervalSec) {
+  if (!intervalSec || intervalSec <= 0) return null;
+  const timer = setInterval(() => {
+    const snap = resetStats();
+    if (snap.reqs > 0 || snap.inFlight > 0 || snap.activeJobs > 0 || snap.queueLen > 0) {
+      logInfo(formatStatsLine(snap, intervalSec));
+    }
+  }, intervalSec * 1000);
+  if (typeof timer.unref === 'function') timer.unref();
+  return timer;
+}
+
+function withJobLock(fn, hooks = null) {
   return new Promise((resolve, reject) => {
+    const enqueuedAt = Date.now();
     const run = () => {
       activeJobs++;
+      bumpPeak('peakJobs', activeJobs);
+      const waitMs = Date.now() - enqueuedAt;
+      if (waitMs > stats.maxWaitMs) stats.maxWaitMs = waitMs;
+      if (hooks && typeof hooks.onStart === 'function') {
+        hooks.onStart({ waitMs, activeJobs, queueLen: jobQueue.length, maxJobs: MAX_JOBS });
+      }
       fn().then(
         (v) => { activeJobs--; pump(); resolve(v); },
         (e) => { activeJobs--; pump(); reject(e); }
@@ -407,46 +557,102 @@ function withJobLock(fn) {
       const next = jobQueue.shift();
       if (next) next();
     };
-    if (activeJobs < MAX_JOBS) run();
-    else jobQueue.push(run);
+    if (activeJobs < MAX_JOBS) {
+      run();
+    } else {
+      jobQueue.push(run);
+      bumpPeak('peakQueue', jobQueue.length);
+      if (hooks && typeof hooks.onQueued === 'function') {
+        hooks.onQueued({ queueLen: jobQueue.length, activeJobs, maxJobs: MAX_JOBS });
+      }
+    }
   });
 }
 
 // ---------- Request handler ----------
 async function handle(req, res) {
-  if (req.method !== 'GET') return send(res, 405, 'method not allowed (only GET)');
+  const startMs = Date.now();
   const u = new URL(req.url, 'http://localhost');
   // Health always reachable without auth (Docker healthcheck)
-  if (u.pathname === '/health') return send(res, 200, 'ok');
+  if (u.pathname === '/health') {
+    logDebug('health status=200');
+    return send(res, 200, 'ok');
+  }
+
+  inFlight++;
+  stats.reqs++;
+  bumpPeak('peakInFlight', inFlight);
+
+  let released = false;
+  const releaseInFlight = () => {
+    if (released) return;
+    released = true;
+    inFlight = Math.max(0, inFlight - 1);
+  };
+  res.on('finish', releaseInFlight);
+  res.on('close', () => {
+    const aborted = !res.writableEnded;
+    releaseInFlight();
+    if (aborted) {
+      stats.aborted++;
+      logWarn(
+        `client_aborted ep=${u.pathname} elapsed_ms=${Date.now() - startMs} ` +
+        `inflight=${inFlight} jobs=${activeJobs}/${MAX_JOBS} queue=${jobQueue.length} ` +
+        `path=${safeVal(u.searchParams.get('path'))}`
+      );
+    }
+  });
+
+  const fail = (code, body, reason) => {
+    stats.errors++;
+    logWarn(
+      `req ep=${u.pathname} status=${code} ms=${Date.now() - startMs} ` +
+      `reason=${safeVal(reason || body)} inflight=${inFlight} path=${safeVal(u.searchParams.get('path'))}`
+    );
+    return send(res, code, body);
+  };
+
+  if (req.method !== 'GET') return fail(405, 'method not allowed (only GET)', 'method_not_allowed');
   // Auth
   if (TOKEN) {
     const got = req.headers['x-thumb-token'] || '';
     const a = Buffer.from(got);
     const b = Buffer.from(TOKEN);
     const ok = a.length === b.length && crypto.timingSafeEqual(a, b);
-    if (!ok) return send(res, 401, 'unauthorized');
+    if (!ok) return fail(401, 'unauthorized', 'unauthorized');
   }
   // Duration metadata: GET /duration?path=<abs> -> JSON {"duration": 12.34}
   // Used by xplorer's getMediaLength() — thumbd owns ffprobe, so the app image
   // stays slim (no ffmpeg/ffprobe binaries needed in the PHP container).
   if (u.pathname === '/duration') {
     const dp = u.searchParams.get('path');
-    if (!dp) return send(res, 400, 'missing path');
+    if (!dp) return fail(400, 'missing path', 'missing_path');
     const dAbs = path.isAbsolute(dp) ? dp : path.join(ROOTS[0], dp);
     const dReal = await resolveAllowed(dAbs);
-    if (!dReal) return send(res, 403, 'path not allowed or not found');
+    if (!dReal) return fail(403, 'path not allowed or not found', 'forbidden_path');
     // cache: duration of a file never changes → key on realPath only
     const dKey = crypto.createHash('sha1').update(`duration|${dReal}`).digest('hex');
     const dFile = path.join(CACHE_DIR, dKey.slice(0, 2), dKey + '.json');
     try {
       const cached = await fsp.readFile(dFile, 'utf8');
+      stats.probeHit++;
+      logDebug(`probe ep=/duration src=cache ms=${Date.now() - startMs} inflight=${inFlight} path=${safeVal(dReal)}`);
       return send(res, 200, cached, { 'Content-Type': 'application/json', 'Cache-Control': 'public, max-age=604800' });
     } catch { /* cache miss */ }
-    const dInfo = await probeVideo(dReal);
+    stats.probeMiss++;
+    activeProbes++;
+    bumpPeak('peakProbes', activeProbes);
+    let dInfo;
+    try {
+      dInfo = await probeVideo(dReal);
+    } finally {
+      activeProbes = Math.max(0, activeProbes - 1);
+    }
     const dur = (dInfo && dInfo.duration !== null) ? dInfo.duration : 0;
     const body = JSON.stringify({ duration: dur });
     await fsp.mkdir(path.dirname(dFile), { recursive: true }).catch(() => {});
     await fsp.writeFile(dFile, body).catch(() => {});
+    logInfo(`probe ep=/duration src=probed ms=${Date.now() - startMs} duration=${dur}s inflight=${inFlight} probes=${activeProbes} path=${safeVal(dReal)}`);
     return send(res, 200, body, { 'Content-Type': 'application/json', 'Cache-Control': 'public, max-age=604800' });
   }
   // Display dimensions: GET /dimensions?path=<abs> -> JSON
@@ -456,30 +662,44 @@ async function handle(req, res) {
   // not probeable. Nothing is cached in that case, so a later retry can succeed.
   if (u.pathname === '/dimensions') {
     const mp = u.searchParams.get('path');
-    if (!mp) return send(res, 400, 'missing path');
+    if (!mp) return fail(400, 'missing path', 'missing_path');
     const mAbs = path.isAbsolute(mp) ? mp : path.join(ROOTS[0], mp);
     const mReal = await resolveAllowed(mAbs);
-    if (!mReal) return send(res, 403, 'path not allowed or not found');
+    if (!mReal) return fail(403, 'path not allowed or not found', 'forbidden_path');
     const mKey = crypto.createHash('sha1').update(`dimensions|${mReal}`).digest('hex');
     const mFile = path.join(CACHE_DIR, mKey.slice(0, 2), mKey + '.json');
     try {
       const cached = await fsp.readFile(mFile, 'utf8');
+      stats.probeHit++;
+      logDebug(`probe ep=/dimensions src=cache ms=${Date.now() - startMs} inflight=${inFlight} path=${safeVal(mReal)}`);
       return send(res, 200, cached, { 'Content-Type': 'application/json', 'Cache-Control': 'public, max-age=604800' });
     } catch { /* cache miss */ }
-    const mInfo = await probeMediaDimensions(mReal);
+    stats.probeMiss++;
+    activeProbes++;
+    bumpPeak('peakProbes', activeProbes);
+    let mInfo;
+    try {
+      mInfo = await probeMediaDimensions(mReal);
+    } finally {
+      activeProbes = Math.max(0, activeProbes - 1);
+    }
+    const rw = (mInfo && mInfo.width) || 0;
+    const rh = (mInfo && mInfo.height) || 0;
+    const rrot = (mInfo && mInfo.rotation) || 0;
     const mBody = JSON.stringify({
-      width: (mInfo && mInfo.width) || 0,
-      height: (mInfo && mInfo.height) || 0,
-      rotation: (mInfo && mInfo.rotation) || 0,
+      width: rw,
+      height: rh,
+      rotation: rrot,
     });
     if (mInfo && mInfo.width && mInfo.height) {
       // dimensions of a file never change → cache only real results
       await fsp.mkdir(path.dirname(mFile), { recursive: true }).catch(() => {});
       await fsp.writeFile(mFile, mBody).catch(() => {});
     }
+    logInfo(`probe ep=/dimensions src=probed ms=${Date.now() - startMs} dims=${rw}x${rh} rot=${rrot} inflight=${inFlight} probes=${activeProbes} path=${safeVal(mReal)}`);
     return send(res, 200, mBody, { 'Content-Type': 'application/json', 'Cache-Control': 'public, max-age=604800' });
   }
-  if (u.pathname !== '/thumb') return send(res, 404, 'not found: use /thumb?path=...&w=...&h=...&t=...');
+  if (u.pathname !== '/thumb') return fail(404, 'not found: use /thumb?path=...&w=...&h=...&t=...', 'not_found');
 
   const p = u.searchParams.get('path');
   const w = Math.min(parseInt(u.searchParams.get('w') || '320', 10) || 320, 1024);
@@ -494,21 +714,21 @@ async function handle(req, res) {
   const fps = Math.max(1, Math.min(30, parseInt(u.searchParams.get('fps') || '10', 10) || 10));
   const count = Math.max(1, Math.min(60, parseInt(u.searchParams.get('count') || '3', 10) || 3));
   const interval = Math.max(0, parseFloat(u.searchParams.get('interval') || '0'));
-  if (!p) return send(res, 400, 'missing path');
+  if (!p) return fail(400, 'missing path', 'missing_path');
 
   // Build absolute path (only if already absolute, otherwise relative to first root)
   const abs = path.isAbsolute(p) ? p : path.join(ROOTS[0], p);
   const real = await resolveAllowed(abs);
-  if (!real) return send(res, 403, 'path not allowed or not found');
+  if (!real) return fail(403, 'path not allowed or not found', 'forbidden_path');
 
   const stat = await fsp.stat(real).catch(() => null);
-  if (!stat || !stat.isFile()) return send(res, 404, 'not a file');
-  if (stat.size > MAX_SRC_MB * 1024 * 1024) return send(res, 413, 'source too large');
+  if (!stat || !stat.isFile()) return fail(404, 'not a file', 'not_a_file');
+  if (stat.size > MAX_SRC_MB * 1024 * 1024) return fail(413, 'source too large', 'source_too_large');
 
   const ext = path.extname(real).toLowerCase();
   const isVideo = VIDEO_EXTS.has(ext);
   const isImage = IMAGE_EXTS.has(ext);
-  if (!isVideo && !isImage) return send(res, 415, 'unsupported type');
+  if (!isVideo && !isImage) return fail(415, 'unsupported type', 'unsupported_type');
 
   // Cache (read is skipped when nocache=1, write still happens below)
   // cache key includes the mode + mode params so still/preview/slideshow stay separate
@@ -517,6 +737,16 @@ async function handle(req, res) {
   if (!noCache) {
     try {
       const st = await fsp.stat(cp);
+      stats.thumbHit++;
+      const hitMs = Date.now() - startMs;
+      const outKb = Math.round(st.size / 1024);
+      const kindLabel = isVideo ? 'video' : 'image';
+      const modeLabel = isVideo ? mode : 'img';
+      if (hitMs >= 250) {
+        logWarn(`thumb status=200 src=cache slow=true kind=${kindLabel} mode=${modeLabel} size=${w}x${h} ms=${hitMs} out_kb=${outKb} inflight=${inFlight} path=${safeVal(real)}`);
+      } else {
+        logDebug(`thumb status=200 src=cache kind=${kindLabel} mode=${modeLabel} size=${w}x${h} ms=${hitMs} out_kb=${outKb} inflight=${inFlight} path=${safeVal(real)}`);
+      }
       res.writeHead(200, {
         'Content-Type': 'image/webp',
         'Cache-Control': `public, max-age=${CACHE_MAX_AGE}`,
@@ -531,6 +761,9 @@ async function handle(req, res) {
   // Generate
   const outTmp = cp + '.tmp.' + process.pid;
   await fsp.mkdir(path.dirname(cp), { recursive: true });
+  let waitMs = 0;
+  let workMs = 0;
+  let usedDec = isVideo ? 'sw' : 'sharp';
   try {
     if (isVideo) {
       // Video generation is heavy (mix = 30+ ffmpeg calls) — run it through the
@@ -539,9 +772,11 @@ async function handle(req, res) {
       // cold grid fills instantly with stills while the animated mixes queue up
       // behind them (progressive thumbnail UX — see xplorer thumb-progressive.js).
       const run = async () => {
+        const workStart = Date.now();
         const info = await probeVideo(real);
         const v4l2 = await hasV4l2Decoder(V4L2).catch(() => false);
         const decoder = pickDecoder(info ? info.codec : null, v4l2);
+        usedDec = decoder || 'sw';
         const dur = info ? info.duration : null;
         // clamp seek time for long videos (still/preview only)
         const seek = (dur !== null && t > dur) ? Math.max(0, Math.min(VIDEO_MAX_SEC, dur / 2)) : t;
@@ -587,18 +822,45 @@ async function handle(req, res) {
       } catch (hwErr) {
         if (decoder) {
           // HW decode failed (e.g. codec details) → software retry
-          log('hw decode failed, fallback to software:', real, hwErr.message);
+          usedDec = 'sw-fallback';
+          logWarn(`hw_decode_fallback path=${safeVal(real)} err=${safeVal(hwErr.message)}`);
           await generate(null);
         } else throw hwErr;
+      } finally {
+        workMs = Date.now() - workStart;
       }
       };
       if (mode === 'still') {
-        await run();  // cheap single ffmpeg call — no queue, grid fills instantly
+        activeVideoStill++;
+        bumpPeak('peakStill', activeVideoStill);
+        try {
+          await run();  // cheap single ffmpeg call — no queue, grid fills instantly
+        } finally {
+          activeVideoStill = Math.max(0, activeVideoStill - 1);
+        }
+        stats.thumbGenStill++;
       } else {
-        await withJobLock(run);  // preview/slideshow/mix are heavy — serialize
+        await withJobLock(run, {
+          onQueued: ({ queueLen }) => {
+            const msg = `thumb queued mode=${mode} active=${activeJobs}/${MAX_JOBS} queue=${queueLen} inflight=${inFlight} path=${safeVal(real)}`;
+            if (queueLen >= MAX_JOBS * 2) logWarn(msg);
+            else logInfo(msg);
+          },
+          onStart: ({ waitMs: wms }) => { waitMs = wms; },
+        });  // preview/slideshow/mix are heavy — serialize
+        stats.thumbGenAnim++;
       }
     } else {
-      await makeImageThumb(real, w, h, outTmp, fit);
+      activeImages++;
+      bumpPeak('peakImg', activeImages);
+      const workStart = Date.now();
+      try {
+        usedDec = await makeImageThumb(real, w, h, outTmp, fit);
+      } finally {
+        workMs = Date.now() - workStart;
+        activeImages = Math.max(0, activeImages - 1);
+      }
+      stats.thumbGenImg++;
     }
     // Retry rename if directory was removed between mkdir and rename
     let renamed = false;
@@ -618,16 +880,28 @@ async function handle(req, res) {
     if (!renamed) {
       // Final attempt failed after retries
       await fsp.unlink(outTmp).catch(() => {});
-      log('thumb failed', real, 'rename failed after 3 attempts');
+      stats.errors++;
+      logError(`thumb status=500 kind=${isVideo ? 'video' : 'image'} mode=${isVideo ? mode : 'img'} wait_ms=${waitMs} total_ms=${Date.now() - startMs} inflight=${inFlight} jobs=${activeJobs}/${MAX_JOBS} queue=${jobQueue.length} path=${safeVal(real)} err=rename_failed_after_3_attempts`);
       return send(res, 500, 'thumbnail failed: rename failed');
     }
   } catch (e) {
     await fsp.unlink(outTmp).catch(() => {});
-    log('thumb failed', real, e.message);
+    stats.errors++;
+    logError(`thumb status=500 kind=${isVideo ? 'video' : 'image'} mode=${isVideo ? mode : 'img'} wait_ms=${waitMs} total_ms=${Date.now() - startMs} inflight=${inFlight} jobs=${activeJobs}/${MAX_JOBS} queue=${jobQueue.length} path=${safeVal(real)} err=${safeVal(e.message)}`);
     return send(res, 500, 'thumbnail failed: ' + e.message);
   }
 
   const st = await fsp.stat(cp);
+  const totalMs = Date.now() - startMs;
+  stats.genCount++;
+  stats.genTotalMs += totalMs;
+  if (totalMs > stats.maxGenMs) stats.maxGenMs = totalMs;
+  logInfo(
+    `thumb status=200 src=generated kind=${isVideo ? 'video' : 'image'} mode=${isVideo ? mode : 'img'} ` +
+    `size=${w}x${h} fit=${fit} dec=${usedDec} wait_ms=${waitMs} work_ms=${workMs} total_ms=${totalMs} ` +
+    `out_kb=${Math.round(st.size / 1024)} inflight=${inFlight} img=${activeImages} still=${activeVideoStill} ` +
+    `jobs=${activeJobs}/${MAX_JOBS} queue=${jobQueue.length} path=${safeVal(real)}`
+  );
   res.writeHead(200, {
     'Content-Type': 'image/webp',
     'Cache-Control': `public, max-age=${CACHE_MAX_AGE}`,
@@ -641,13 +915,19 @@ async function handle(req, res) {
 async function main() {
   await fsp.mkdir(CACHE_DIR, { recursive: true });
   const hw = await hasV4l2Decoder(V4L2).catch(() => false);
-  log(`thumbd start port=${PORT} roots=${ROOTS.join(',')} cache=${CACHE_DIR} v4l2_devices=${hw} (HEVC-only on Pi 5; H.264=software)`);
+  logInfo(
+    `thumbd start port=${PORT} roots=${ROOTS.join(',')} cache=${CACHE_DIR} ` +
+    `max_jobs=${MAX_JOBS} max_src_mb=${MAX_SRC_MB} video_max_sec=${VIDEO_MAX_SEC} ` +
+    `v4l2=${V4L2 || 'off'} v4l2_available=${hw} log_level=${levelName(logLevel)} ` +
+    `stats_interval_s=${STATS_INTERVAL_SEC} cpus=${os.cpus().length}`
+  );
+  startStatsReporter(STATS_INTERVAL_SEC);
   http.createServer(handle).listen(PORT, '0.0.0.0');
 }
 
 // Testability: only start when executed directly; export as module otherwise
 if (require.main === module) {
-  main().catch(e => { log('fatal:', e); process.exit(1); });
+  main().catch(e => { logError('fatal:', e); process.exit(1); });
 }
 
 // Test hook: tests run with a temp dir instead of /data (ROOTS is otherwise fixed).
@@ -657,5 +937,6 @@ module.exports = {
   handle, main, resolveAllowed, cachePath, probeVideo, hasV4l2Decoder, pickDecoder,
   makeImageThumb, makeVideoThumb, makeVideoPreview, makeVideoSlideshow, makeVideoMix,
   buildAnimatedWebP, extractVideoFrame, withJobLock,
+  parseLogLevel, setLogLevel, getLogLevel, getStatsSnapshot, resetStats, formatStatsLine,
   setRoots, ROOTS, CACHE_DIR, TOKEN, PORT,
 };

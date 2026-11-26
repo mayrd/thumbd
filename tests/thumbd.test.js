@@ -538,3 +538,83 @@ test('POST /thumb -> 405 (GET only)', async () => {
   const r = await post('/thumb?path=test.png&w=100&h=100', { 'X-Thumb-Token': 'testtoken123' });
   assert.equal(r.status, 405);
 });
+
+// ---------- Unit & Integration: logging & concurrency metrics ----------
+test('parseLogLevel maps all levels and defaults to info', () => {
+  assert.equal(thumbd.parseLogLevel(''), 3);
+  assert.equal(thumbd.parseLogLevel(undefined), 3);
+  assert.equal(thumbd.parseLogLevel('unknown'), 3);
+  assert.equal(thumbd.parseLogLevel('off'), 0);
+  assert.equal(thumbd.parseLogLevel('0'), 0);
+  assert.equal(thumbd.parseLogLevel('error'), 1);
+  assert.equal(thumbd.parseLogLevel('1'), 1);
+  assert.equal(thumbd.parseLogLevel('warn'), 2);
+  assert.equal(thumbd.parseLogLevel('warning'), 2);
+  assert.equal(thumbd.parseLogLevel('2'), 2);
+  assert.equal(thumbd.parseLogLevel('info'), 3);
+  assert.equal(thumbd.parseLogLevel('3'), 3);
+  assert.equal(thumbd.parseLogLevel('debug'), 4);
+  assert.equal(thumbd.parseLogLevel('all'), 4);
+  assert.equal(thumbd.parseLogLevel('4'), 4);
+});
+
+test('withJobLock tracks peakJobs, peakQueue, maxWaitMs and invokes hooks', async () => {
+  thumbd.resetStats();
+  let queuedCalls = 0;
+  let startedCalls = 0;
+  const hooks = {
+    onQueued: () => { queuedCalls++; },
+    onStart: () => { startedCalls++; },
+  };
+  const job = () => thumbd.withJobLock(async () => {
+    await new Promise(r => setTimeout(r, 25));
+  }, hooks);
+  await Promise.all([job(), job(), job(), job(), job()]);
+  const snap = thumbd.getStatsSnapshot();
+  assert.equal(startedCalls, 5);
+  assert.ok(queuedCalls >= 3, `expected at least 3 queued callbacks, got ${queuedCalls}`);
+  assert.equal(snap.peakJobs, 2);
+  assert.ok(snap.peakQueue >= 3, `expected peakQueue >= 3, got ${snap.peakQueue}`);
+  assert.ok(snap.maxWaitMs >= 15, `expected maxWaitMs >= 15, got ${snap.maxWaitMs}`);
+});
+
+test('stats snapshot and formatStatsLine record thumb/probe hits and misses', async () => {
+  thumbd.resetStats();
+  const prevLevel = thumbd.getLogLevel();
+  thumbd.setLogLevel('off');
+  try {
+    const imgPath = `/thumb?path=${encodeURIComponent('test.png')}&w=77&h=77`;
+    const r1 = await get(imgPath, { 'X-Thumb-Token': 'testtoken123' });
+    assert.equal(r1.status, 200);
+    assert.equal(r1.headers['x-thumb-source'], 'generated');
+
+    const r2 = await get(imgPath, { 'X-Thumb-Token': 'testtoken123' });
+    assert.equal(r2.status, 200);
+    assert.equal(r2.headers['x-thumb-source'], 'cache');
+
+    // Use a separate file for probe miss + hit check
+    const probeImg = path.join(ROOT, 'probe-stats.png');
+    await sharp({ create: { width: 32, height: 24, channels: 3, background: { r: 10, g: 20, b: 30 } } })
+      .png().toFile(probeImg);
+    const dimUrl = `/dimensions?path=${encodeURIComponent('probe-stats.png')}`;
+    const d1 = await get(dimUrl, { 'X-Thumb-Token': 'testtoken123' });
+    assert.equal(d1.status, 200);
+    const d2 = await get(dimUrl, { 'X-Thumb-Token': 'testtoken123' });
+    assert.equal(d2.status, 200);
+
+    const snap = thumbd.getStatsSnapshot();
+    assert.equal(snap.reqs, 4);
+    assert.equal(snap.thumbGenImg, 1);
+    assert.equal(snap.thumbHit, 1);
+    assert.equal(snap.probeMiss, 1);
+    assert.equal(snap.probeHit, 1);
+    assert.equal(snap.inFlight, 0);
+    assert.ok(snap.peakInFlight >= 1);
+
+    const line = thumbd.formatStatsLine(snap, 30);
+    assert.match(line, /^stats window=30s reqs=4 thumb_hit=1 thumb_gen=1\(img=1,still=0,anim=0\) probe_hit=1 probe_miss=1/);
+    assert.match(line, /peak_jobs=\d+\/2 peak_queue=\d+/);
+  } finally {
+    thumbd.setLogLevel(prevLevel);
+  }
+});

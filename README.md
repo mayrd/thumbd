@@ -120,6 +120,22 @@ cached forever (duration/dimensions of a file never change):
 | `PUID` / `PGID` | `1000` / `1000` | User the daemon drops to (set to your host user's ids) |
 | `THUMBD_MAX_SRC_MB` | `4096` | Max source file size (TV episodes are often 1–2 GB) |
 | `THUMBD_VIDEO_MAX_SEC` | `600` | Videos >10 min: still from the first half |
+| `THUMBD_MAX_JOBS` | `2` | Max concurrent heavy video jobs (`preview`/`slideshow`/`mix`); `still` & images bypass this queue |
+| `THUMBD_LOG_LEVEL` | `info` | Log verbosity: `off` (`0`), `error` (`1`), `warn` (`2`), `info` (`3`), `debug`/`all` (`4`) |
+| `THUMBD_STATS_INTERVAL_SEC` | `30` | Interval in seconds for periodic `stats` summary lines (`0` disables; silent when idle) |
+
+### Logging & concurrency tuning
+
+At `THUMBD_LOG_LEVEL=info` (default), `thumbd` logs every generated thumbnail (`thumb status=200 src=generated ...`), every metadata probe miss (`probe ep=/dimensions ...`), queue waits (`thumb queued ...`), client aborts (`client_aborted ...`), and a periodic `stats` line whenever traffic occurred:
+
+```
+2026-11-26T18:30:30.000Z INFO stats window=30s reqs=48 thumb_hit=20 thumb_gen=28(img=18,still=6,anim=4) probe_hit=0 probe_miss=0 err=0 aborted=0 peak_inflight=9 peak_img=5 peak_still=3 peak_jobs=2/2 peak_queue=4 peak_probes=0 avg_gen_ms=420 max_gen_ms=3150 max_wait_ms=1800 load1m=1.42 rss_mb=95 heap_mb=24
+```
+
+- Set `THUMBD_LOG_LEVEL=debug` to also log every `/thumb`, `/dimensions`, and `/duration` disk-cache hit and `/health` check.
+- Use `peak_jobs`, `peak_queue`, `max_wait_ms`, `peak_still`, `peak_img`, and `load1m` to tune `THUMBD_MAX_JOBS` (default `2`) and client concurrency (`xplorer`'s `thumb-progressive.js` `MAX_CONCURRENT`):
+  - If `peak_queue > 0` and `max_wait_ms` is high while `load1m` is low (< CPU count), increasing `THUMBD_MAX_JOBS` (e.g. `3` or `4`) can improve throughput.
+  - If `aborted > 0` or `load1m` exceeds CPU count and `max_gen_ms` spikes, lower `THUMBD_MAX_JOBS` or client concurrency.
 
 ## Hardware video decode (optional, Pi 5 / HEVC)
 
