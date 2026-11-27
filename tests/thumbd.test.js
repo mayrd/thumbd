@@ -19,6 +19,7 @@ fs.mkdirSync(ROOT, { recursive: true });
 process.env.THUMBD_CACHE = CACHE;
 process.env.THUMBD_TOKEN = 'testtoken123';
 process.env.THUMBD_PORT = '0'; // ephemeral
+process.env.THUMBD_MAX_JOBS = '2'; // deterministic lock/stats assertions regardless of host CPU count
 
 const thumbd = require('../server.js');
 thumbd.setRoots([ROOT]); // tests run on a temp dir; production root is always /data
@@ -617,4 +618,46 @@ test('stats snapshot and formatStatsLine record thumb/probe hits and misses', as
   } finally {
     thumbd.setLogLevel(prevLevel);
   }
+});
+
+test('mapConcurrent bounds parallelism, preserves order, and propagates errors', async () => {
+  const items = [10, 20, 30, 40, 50];
+  let running = 0;
+  let maxRunning = 0;
+  const results = await thumbd.mapConcurrent(items, 2, async (val, idx) => {
+    running++;
+    maxRunning = Math.max(maxRunning, running);
+    await new Promise(r => setTimeout(r, (items.length - idx) * 10));
+    running--;
+    return `${idx}:${val * 2}`;
+  });
+  assert.ok(maxRunning <= 2 && maxRunning >= 1, `expected concurrency in 1..2, got ${maxRunning}`);
+  assert.deepEqual(results, ['0:20', '1:40', '2:60', '3:80', '4:100']);
+
+  let startedAfterError = 0;
+  await assert.rejects(
+    () => thumbd.mapConcurrent([1, 2, 3, 4], 2, async (v) => {
+      if (v === 1) throw new Error('boom');
+      if (v >= 3) startedAfterError++;
+      await new Promise(r => setTimeout(r, 20));
+      return v;
+    }),
+    /boom/
+  );
+  assert.equal(startedAfterError, 0);
+});
+
+test('withImageLock bounds concurrent image jobs to MAX_IMG_JOBS', async () => {
+  let running = 0;
+  let maxRunning = 0;
+  const total = thumbd.MAX_IMG_JOBS + 3;
+  const jobs = Array.from({ length: total }, () => thumbd.withImageLock(async () => {
+    running++;
+    maxRunning = Math.max(maxRunning, running);
+    await new Promise(r => setTimeout(r, 20));
+    running--;
+  }));
+  await Promise.all(jobs);
+  assert.ok(maxRunning <= thumbd.MAX_IMG_JOBS, `expected max ${thumbd.MAX_IMG_JOBS}, got ${maxRunning}`);
+  assert.ok(maxRunning >= 1);
 });

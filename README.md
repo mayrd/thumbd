@@ -120,7 +120,10 @@ cached forever (duration/dimensions of a file never change):
 | `PUID` / `PGID` | `1000` / `1000` | User the daemon drops to (set to your host user's ids) |
 | `THUMBD_MAX_SRC_MB` | `4096` | Max source file size (TV episodes are often 1–2 GB) |
 | `THUMBD_VIDEO_MAX_SEC` | `600` | Videos >10 min: still from the first half |
-| `THUMBD_MAX_JOBS` | `2` | Max concurrent heavy video jobs (`preview`/`slideshow`/`mix`); `still` & images bypass this queue |
+| `THUMBD_MAX_JOBS` | CPU count (max `8`) | Max concurrent heavy video jobs (`preview`/`slideshow`/`mix`); `still` & images bypass this queue |
+| `THUMBD_MAX_IMG_JOBS` | CPU count (max `8`) | Max concurrent image resize jobs (`sharp`) |
+| `THUMBD_SHARP_CONCURRENCY` | *(auto)* | Threads per `sharp` job (default auto: uses all cores in Docker with `libjemalloc2`) |
+| `UV_THREADPOOL_SIZE` | `16` *(Docker)* | Node libuv worker pool size for `sharp` + async filesystem I/O |
 | `THUMBD_LOG_LEVEL` | `info` | Log verbosity: `off` (`0`), `error` (`1`), `warn` (`2`), `info` (`3`), `debug`/`all` (`4`) |
 | `THUMBD_STATS_INTERVAL_SEC` | `30` | Interval in seconds for periodic `stats` summary lines (`0` disables; silent when idle) |
 
@@ -133,8 +136,9 @@ At `THUMBD_LOG_LEVEL=info` (default), `thumbd` logs every generated thumbnail (`
 ```
 
 - Set `THUMBD_LOG_LEVEL=debug` to also log every `/thumb`, `/dimensions`, and `/duration` disk-cache hit and `/health` check.
-- Use `peak_jobs`, `peak_queue`, `max_wait_ms`, `peak_still`, `peak_img`, and `load1m` to tune `THUMBD_MAX_JOBS` (default `2`) and client concurrency (`xplorer`'s `thumb-progressive.js` `MAX_CONCURRENT`):
-  - If `peak_queue > 0` and `max_wait_ms` is high while `load1m` is low (< CPU count), increasing `THUMBD_MAX_JOBS` (e.g. `3` or `4`) can improve throughput.
+- The Docker image installs `libjemalloc2` (preloaded via `LD_PRELOAD` in `entrypoint.sh`) and sets `UV_THREADPOOL_SIZE=16`, allowing `sharp` (libvips) to use multi-threaded image processing across all CPU cores without glibc fragmentation.
+- Use `peak_jobs`, `peak_queue`, `max_wait_ms`, `peak_still`, `peak_img`, and `load1m` to tune `THUMBD_MAX_JOBS` (default: CPU count, max `8`), `THUMBD_MAX_IMG_JOBS`, and client concurrency (`xplorer`'s `thumb-progressive.js` `MAX_CONCURRENT`):
+  - If `peak_queue > 0` and `max_wait_ms` is high while `load1m` is low (< CPU count), increasing `THUMBD_MAX_JOBS` can improve throughput.
   - If `aborted > 0` or `load1m` exceeds CPU count and `max_gen_ms` spikes, lower `THUMBD_MAX_JOBS` or client concurrency.
 
 ## Hardware video decode (optional, Pi 5 / HEVC)

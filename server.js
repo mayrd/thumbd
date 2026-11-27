@@ -23,8 +23,22 @@ const VIDEO_MAX_SEC = parseInt(process.env.THUMBD_VIDEO_MAX_SEC || '600', 10); /
 const FFMPEG = process.env.THUMBD_FFMPEG || 'ffmpeg';
 const FFPROBE = process.env.THUMBD_FFPROBE || 'ffprobe';
 const V4L2 = process.env.THUMBD_V4L2 || 'drm';            // HW accel: 'drm' = stateless V4L2 (Pi 5 HEVC); '' = off
+const CPUS = Math.max(1, typeof os.availableParallelism === 'function' ? os.availableParallelism() : os.cpus().length);
 const IMAGE_EXTS = new Set(['.jpg', '.jpeg', '.png', '.webp', '.gif', '.avif', '.tif', '.tiff', '.bmp']);
 const VIDEO_EXTS = new Set(['.mp4', '.mov', '.mpg', '.mpeg', '.avi', '.flv', '.wmv', '.asf', '.mkv', '.webm', '.m4v', '.ts']);
+
+let sharpMod = null;
+function getSharp() {
+  if (!sharpMod) {
+    sharpMod = require('sharp');
+    const rawConc = (process.env.THUMBD_SHARP_CONCURRENCY ?? '').trim();
+    if (rawConc !== '') {
+      const n = parseInt(rawConc, 10);
+      if (Number.isFinite(n) && n >= 0) sharpMod.concurrency(n);
+    }
+  }
+  return sharpMod;
+}
 
 const LOG_LEVEL_MAP = {
   off: 0, '0': 0,
@@ -80,12 +94,21 @@ function safeVal(v) {
 }
 
 // Is the path inside one of the roots? (symlink-safe via realpath)
+let resolvedRootsCache = null;
+async function getResolvedRoots() {
+  if (!resolvedRootsCache) {
+    const resolved = await Promise.all(ROOTS.map((root) => fsp.realpath(root).catch(() => null)));
+    resolvedRootsCache = resolved.filter(Boolean);
+  }
+  return resolvedRootsCache;
+}
+
 async function resolveAllowed(absPath) {
   const real = await fsp.realpath(absPath).catch(() => null);
   if (!real) return null;
-  for (const root of ROOTS) {
-    const r = await fsp.realpath(root).catch(() => null);
-    if (r && (real === r || real.startsWith(r + path.sep))) return real;
+  const roots = await getResolvedRoots();
+  for (const r of roots) {
+    if (real === r || real.startsWith(r + path.sep)) return real;
   }
   return null;
 }
@@ -148,7 +171,7 @@ function probeImageDimensions(realPath) {
   return new Promise((resolve) => {
     let sharp;
     try {
-      sharp = require('sharp');
+      sharp = getSharp();
     } catch {
       return resolve(null);            // no sharp -> caller falls back to its own path
     }
@@ -193,6 +216,14 @@ function hasV4l2Decoder(decoder) {
   });
 }
 
+let v4l2Promise = null;
+function getV4l2Available() {
+  if (!v4l2Promise) {
+    v4l2Promise = hasV4l2Decoder(V4L2).catch(() => false);
+  }
+  return v4l2Promise;
+}
+
 // Pi 5: NO HW H.264 decoder (only HEVC via rpi-hevc-dec) — h264 stays software.
 // HEVC HW decode uses the STATELESS V4L2 path (`-hwaccel drm`), NOT the mem2mem
 // wrapper: `hevc_v4l2m2m` fails on the rpi-hevc-dec with "can't configure decoder:
@@ -208,7 +239,7 @@ function pickDecoder(codec, v4l2Available) {
 
 // ---------- Thumbnail generation ----------
 async function makeImageThumb(realPath, w, h, outTmp, fit = 'contain') {
-  const sharp = require('sharp');
+  const sharp = getSharp();
   const sharpFit = fit === 'cover' ? 'cover' : 'inside';  // cover = fill+crop, inside = contain (keep ratio)
   const vf = fit === 'cover'
     ? `scale=${w}:${h}:force_original_aspect_ratio=increase,crop=${w}:${h}`
@@ -264,27 +295,120 @@ async function makeVideoThumb(realPath, w, h, t, outTmp, decoder, fit = 'contain
   });
 }
 
+// Bounded async concurrency helper; preserves output order and lets active workers
+// settle on error before rejecting so caller cleanup in `finally` is race-free.
+async function mapConcurrent(items, limit, fn) {
+  if (!items.length) return [];
+  const cap = Math.max(1, Math.min(limit || 1, items.length));
+  const results = new Array(items.length);
+  let nextIdx = 0;
+  let firstErr = null;
+  const worker = async () => {
+    while (!firstErr) {
+      const idx = nextIdx++;
+      if (idx >= items.length) break;
+      try {
+        results[idx] = await fn(items[idx], idx);
+      } catch (err) {
+        if (!firstErr) firstErr = err;
+        break;
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: cap }, worker));
+  if (firstErr) throw firstErr;
+  return results;
+}
+
+// Extract `nFrames` contiguous preview frames from `t` at `fps` in a single ffmpeg pass.
+async function extractVideoPreviewFrames(realPath, t, w, h, fps, nFrames, outTmp, decoder, fit = 'contain') {
+  const seek = Math.max(0, t);
+  const singleFile = `${outTmp}.p0`;
+  const extractFallbackFrame = async () => {
+    try {
+      await extractVideoFrame(realPath, seek, w, h, singleFile, decoder, fit);
+    } catch (err) {
+      if (seek <= 0) throw err;
+      await extractVideoFrame(realPath, Math.max(0, seek - 0.5), w, h, singleFile, decoder, fit);
+    }
+    return fsp.readFile(singleFile);
+  };
+  if (nFrames <= 1) {
+    try {
+      return [await extractFallbackFrame()];
+    } finally {
+      await fsp.unlink(singleFile).catch(() => {});
+    }
+  }
+
+  const decArgs = decoder ? ['-hwaccel', decoder] : [];
+  const scaleVf = fit === 'cover'
+    ? `scale=${w}:${h}:force_original_aspect_ratio=increase,crop=${w}:${h}`
+    : `scale=${w}:${h}:force_original_aspect_ratio=decrease`;
+  const pattern = `${outTmp}.p%03d.webp`;
+  const dir = path.dirname(outTmp);
+  const prefix = `${path.basename(outTmp)}.p`;
+  let createdFiles = [];
+  try {
+    await new Promise((resolve, reject) => {
+      execFile(FFMPEG, [
+        '-y', '-hide_banner', '-loglevel', 'error',
+        '-ss', String(seek),
+        ...decArgs,
+        '-i', realPath,
+        '-vf', `fps=${fps},${scaleVf}`,
+        '-frames:v', String(nFrames),
+        '-q:v', '4',
+        '-c:v', 'libwebp',
+        '-f', 'image2',
+        pattern,
+      ], { timeout: 60000 }, (err) => err ? reject(err) : resolve());
+    });
+    const entries = await fsp.readdir(dir);
+    createdFiles = entries
+      .filter((name) => name.startsWith(prefix) && name.endsWith('.webp'))
+      .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }))
+      .map((name) => path.join(dir, name));
+    const bufs = [];
+    for (const f of createdFiles) {
+      bufs.push(await fsp.readFile(f));
+    }
+    // Near-EOF edge case: fps filter can yield 0 frames if seek lands past the last PTS.
+    if (bufs.length === 0) {
+      bufs.push(await extractFallbackFrame());
+    }
+    return bufs;
+  } finally {
+    await fsp.unlink(singleFile).catch(() => {});
+    for (const f of createdFiles) await fsp.unlink(f).catch(() => {});
+  }
+}
+
+// Extract discrete timestamped frames in parallel (bounded per job across CPUS).
+async function extractVideoFramesParallel(realPath, times, w, h, outTmp, tag, decoder, fit = 'contain') {
+  const concurrency = Math.max(1, Math.ceil(CPUS / Math.max(1, activeJobs)));
+  try {
+    return await mapConcurrent(times, concurrency, async (ts, i) => {
+      const f = `${outTmp}.${tag}${i}`;
+      await extractVideoFrame(realPath, ts, w, h, f, decoder, fit);
+      return fsp.readFile(f);
+    });
+  } finally {
+    for (let i = 0; i < times.length; i++) {
+      await fsp.unlink(`${outTmp}.${tag}${i}`).catch(() => {});
+    }
+  }
+}
+
 // Animated preview: `mode=preview` — animated WebP from `t` for `d` seconds at `fps`
 // (matches the legacy AnimatedVideoThumbnail: -ss 1 -t 3 -vf fps=10 -loop 0).
 // Frames are assembled in Node (buildAnimatedWebP) — ffmpeg's webp muxer (v8) uses
 // delta-frames/partial ANMF chunks with merged delays, which is inconsistent.
 async function makeVideoPreview(realPath, w, h, t, d, fps, outTmp, decoder, fit = 'contain') {
   const nFrames = Math.max(1, Math.round(fps * d));
-  const pFiles = [];
-  try {
-    for (let i = 0; i < nFrames; i++) {
-      const ts = Math.max(0, t + i / fps);
-      const f = `${outTmp}.p${i}`;
-      await extractVideoFrame(realPath, ts, w, h, f, decoder, fit);
-      pFiles.push(f);
-    }
-    const bufs = [];
-    for (const f of pFiles) bufs.push(await fsp.readFile(f));
-    const anim = await buildAnimatedWebP(bufs, bufs.map(() => Math.round(1000 / fps)));
-    await fsp.writeFile(outTmp, anim);
-  } finally {
-    for (const f of pFiles) await fsp.unlink(f).catch(() => {});
-  }
+  const bufs = await extractVideoPreviewFrames(realPath, t, w, h, fps, nFrames, outTmp, decoder, fit);
+  const anim = await buildAnimatedWebP(bufs, bufs.map(() => Math.round(1000 / fps)));
+  await fsp.writeFile(outTmp, anim);
 }
 
 // Extract a single still frame to a file (helper for slideshow)
@@ -312,53 +436,25 @@ async function extractVideoFrame(realPath, ts, w, h, outFile, decoder, fit = 'co
 // (one frame every N seconds) or `count` (N frames evenly spaced over the video).
 // Each frame is shown for 1 second.
 async function makeVideoSlideshow(realPath, w, h, times, outTmp, decoder, fit = 'contain') {
-  const frames = [];
-  try {
-    for (let i = 0; i < times.length; i++) {
-      const f = `${outTmp}.f${i}`;
-      await extractVideoFrame(realPath, times[i], w, h, f, decoder, fit);
-      frames.push(await fsp.readFile(f));
-    }
-    const anim = await buildAnimatedWebP(frames, frames.map(() => 1000));  // 1s per frame
-    await fsp.writeFile(outTmp, anim);
-  } finally {
-    for (let i = 0; i < frames.length; i++) await fsp.unlink(`${outTmp}.f${i}`).catch(() => {});
-  }
+  const frames = await extractVideoFramesParallel(realPath, times, w, h, outTmp, 'f', decoder, fit);
+  const anim = await buildAnimatedWebP(frames, frames.map(() => 1000));  // 1s per frame
+  await fsp.writeFile(outTmp, anim);
 }
 
 // Mix: `mode=mix` — animated preview (t..t+d at fps) followed by a slideshow of the
 // remaining video (count evenly spaced frames, or one frame every interval seconds).
 // Preview frames are shown at 1/fps s each, slideshow frames for 1 s each.
 async function makeVideoMix(realPath, w, h, t, d, fps, times, outTmp, decoder, fit = 'contain') {
-  const frames = [];   // {buf, dur}
-  try {
-    // 1) preview frames: fps*d frames from t..t+d, each displayed 1/fps s
-    const nPrev = Math.max(1, Math.round(fps * d));
-    const pFiles = [];
-    for (let i = 0; i < nPrev; i++) {
-      const ts = Math.max(0, t + i / fps);
-      const f = `${outTmp}.p${i}`;
-      await extractVideoFrame(realPath, ts, w, h, f, decoder, fit);
-      pFiles.push(f);
-    }
-    for (const f of pFiles) frames.push({ buf: await fsp.readFile(f), dur: 1000 / fps });
-    // 2) slideshow frames of the remaining video, each displayed 1 s
-    const sFiles = [];
-    for (let i = 0; i < times.length; i++) {
-      const f = `${outTmp}.s${i}`;
-      await extractVideoFrame(realPath, times[i], w, h, f, decoder, fit);
-      sFiles.push(f);
-    }
-    for (const f of sFiles) frames.push({ buf: await fsp.readFile(f), dur: 1000 });
-    // 3) assemble the animated WebP in Node (ffmpeg 8's webp muxer corrupts mixed delays)
-    const anim = await buildAnimatedWebP(frames.map(fr => fr.buf), frames.map(fr => fr.dur));
-    await fsp.writeFile(outTmp, anim);
-  } finally {
-    for (let i = 0; i < frames.length; i++) {
-      await fsp.unlink(`${outTmp}.p${i}`).catch(() => {});
-      await fsp.unlink(`${outTmp}.s${i}`).catch(() => {});
-    }
-  }
+  const nPrev = Math.max(1, Math.round(fps * d));
+  const prevBufs = await extractVideoPreviewFrames(realPath, t, w, h, fps, nPrev, outTmp, decoder, fit);
+  const slideBufs = await extractVideoFramesParallel(realPath, times, w, h, outTmp, 's', decoder, fit);
+  const frames = [
+    ...prevBufs.map((buf) => ({ buf, dur: 1000 / fps })),
+    ...slideBufs.map((buf) => ({ buf, dur: 1000 })),
+  ];
+  // Assemble the animated WebP in Node (ffmpeg 8's webp muxer corrupts mixed delays)
+  const anim = await buildAnimatedWebP(frames.map(fr => fr.buf), frames.map(fr => fr.dur));
+  await fsp.writeFile(outTmp, anim);
 }
 
 // Build an animated WebP from still frames (each a RIFF/WEBP file with a single
@@ -414,7 +510,7 @@ function chunk(tag, payload) {
 
 // Read width/height from a still WebP's VP8/VP8L image header
 async function getWebpDims(buf) {
-  const sharp = require('sharp');
+  const sharp = getSharp();
   const m = await sharp(buf).metadata();
   return { width: m.width, height: m.height };
 }
@@ -443,9 +539,15 @@ function stripWebpContainer(buf) {
 // 20 parallel mode=mix requests would spawn 600+ ffmpeg processes on a Pi 5 and
 // time everything out. Serialize video generation: MAX_JOBS ffmpeg jobs run in
 // parallel, the rest wait in a FIFO queue. Images are cheap — they bypass it.
-const MAX_JOBS = Math.max(1, parseInt(process.env.THUMBD_MAX_JOBS || '2', 10));
+const DEFAULT_MAX_JOBS = Math.max(1, Math.min(8, CPUS));
+const MAX_JOBS = Math.max(1, parseInt(process.env.THUMBD_MAX_JOBS || String(DEFAULT_MAX_JOBS), 10) || DEFAULT_MAX_JOBS);
+const DEFAULT_MAX_IMG_JOBS = Math.max(1, Math.min(8, CPUS));
+const MAX_IMG_JOBS = Math.max(1, parseInt(process.env.THUMBD_MAX_IMG_JOBS || String(DEFAULT_MAX_IMG_JOBS), 10) || DEFAULT_MAX_IMG_JOBS);
 let activeJobs = 0;
 const jobQueue = [];
+let activeImgJobs = 0;
+const imgQueue = [];
+let tmpSeq = 0;
 let inFlight = 0;
 let activeImages = 0;
 let activeVideoStill = 0;
@@ -565,6 +667,27 @@ function withJobLock(fn, hooks = null) {
       if (hooks && typeof hooks.onQueued === 'function') {
         hooks.onQueued({ queueLen: jobQueue.length, activeJobs, maxJobs: MAX_JOBS });
       }
+    }
+  });
+}
+
+function withImageLock(fn) {
+  return new Promise((resolve, reject) => {
+    const run = () => {
+      activeImgJobs++;
+      fn().then(
+        (v) => { activeImgJobs--; pump(); resolve(v); },
+        (e) => { activeImgJobs--; pump(); reject(e); }
+      );
+    };
+    const pump = () => {
+      const next = imgQueue.shift();
+      if (next) next();
+    };
+    if (activeImgJobs < MAX_IMG_JOBS) {
+      run();
+    } else {
+      imgQueue.push(run);
     }
   });
 }
@@ -759,22 +882,22 @@ async function handle(req, res) {
   }
 
   // Generate
-  const outTmp = cp + '.tmp.' + process.pid;
+  const outTmp = `${cp}.tmp.${process.pid}.${++tmpSeq}`;
   await fsp.mkdir(path.dirname(cp), { recursive: true });
   let waitMs = 0;
   let workMs = 0;
   let usedDec = isVideo ? 'sw' : 'sharp';
   try {
     if (isVideo) {
-      // Video generation is heavy (mix = 30+ ffmpeg calls) — run it through the
-      // concurrency limiter so N parallel requests don't spawn N*30 processes.
+      // Video generation is heavy (mix = 30+ frames) — run it through the
+      // concurrency limiter so N parallel requests don't overwhelm the host.
       // mode=still is ONE cheap ffmpeg call (~0.5s): it bypasses the queue so a
       // cold grid fills instantly with stills while the animated mixes queue up
       // behind them (progressive thumbnail UX — see xplorer thumb-progressive.js).
       const run = async () => {
         const workStart = Date.now();
         const info = await probeVideo(real);
-        const v4l2 = await hasV4l2Decoder(V4L2).catch(() => false);
+        const v4l2 = await getV4l2Available();
         const decoder = pickDecoder(info ? info.codec : null, v4l2);
         usedDec = decoder || 'sw';
         const dur = info ? info.duration : null;
@@ -851,15 +974,17 @@ async function handle(req, res) {
         stats.thumbGenAnim++;
       }
     } else {
-      activeImages++;
-      bumpPeak('peakImg', activeImages);
-      const workStart = Date.now();
-      try {
-        usedDec = await makeImageThumb(real, w, h, outTmp, fit);
-      } finally {
-        workMs = Date.now() - workStart;
-        activeImages = Math.max(0, activeImages - 1);
-      }
+      usedDec = await withImageLock(async () => {
+        activeImages++;
+        bumpPeak('peakImg', activeImages);
+        const workStart = Date.now();
+        try {
+          return await makeImageThumb(real, w, h, outTmp, fit);
+        } finally {
+          workMs = Date.now() - workStart;
+          activeImages = Math.max(0, activeImages - 1);
+        }
+      });
       stats.thumbGenImg++;
     }
     // Retry rename if directory was removed between mkdir and rename
@@ -914,12 +1039,18 @@ async function handle(req, res) {
 // ---------- Start ----------
 async function main() {
   await fsp.mkdir(CACHE_DIR, { recursive: true });
-  const hw = await hasV4l2Decoder(V4L2).catch(() => false);
+  const hw = await getV4l2Available();
+  let sharpConc = 'unavailable';
+  try {
+    sharpConc = getSharp().concurrency();
+  } catch { /* sharp binary may target a different platform in dev */ }
+  const uvPool = process.env.UV_THREADPOOL_SIZE || 4;
   logInfo(
     `thumbd start port=${PORT} roots=${ROOTS.join(',')} cache=${CACHE_DIR} ` +
-    `max_jobs=${MAX_JOBS} max_src_mb=${MAX_SRC_MB} video_max_sec=${VIDEO_MAX_SEC} ` +
+    `max_jobs=${MAX_JOBS} max_img_jobs=${MAX_IMG_JOBS} sharp_concurrency=${sharpConc} uv_threadpool=${uvPool} ` +
+    `max_src_mb=${MAX_SRC_MB} video_max_sec=${VIDEO_MAX_SEC} ` +
     `v4l2=${V4L2 || 'off'} v4l2_available=${hw} log_level=${levelName(logLevel)} ` +
-    `stats_interval_s=${STATS_INTERVAL_SEC} cpus=${os.cpus().length}`
+    `stats_interval_s=${STATS_INTERVAL_SEC} cpus=${CPUS}`
   );
   startStatsReporter(STATS_INTERVAL_SEC);
   http.createServer(handle).listen(PORT, '0.0.0.0');
@@ -931,12 +1062,13 @@ if (require.main === module) {
 }
 
 // Test hook: tests run with a temp dir instead of /data (ROOTS is otherwise fixed).
-function setRoots(roots) { ROOTS = Array.isArray(roots) ? roots : [roots]; }
+function setRoots(roots) { ROOTS = Array.isArray(roots) ? roots : [roots]; resolvedRootsCache = null; }
 
 module.exports = {
   handle, main, resolveAllowed, cachePath, probeVideo, hasV4l2Decoder, pickDecoder,
   makeImageThumb, makeVideoThumb, makeVideoPreview, makeVideoSlideshow, makeVideoMix,
-  buildAnimatedWebP, extractVideoFrame, withJobLock,
+  buildAnimatedWebP, stripWebpContainer, extractVideoFrame, extractVideoPreviewFrames,
+  extractVideoFramesParallel, mapConcurrent, withJobLock, withImageLock,
   parseLogLevel, setLogLevel, getLogLevel, getStatsSnapshot, resetStats, formatStatsLine,
-  setRoots, ROOTS, CACHE_DIR, TOKEN, PORT,
+  setRoots, ROOTS, CACHE_DIR, TOKEN, PORT, CPUS, MAX_JOBS, MAX_IMG_JOBS,
 };

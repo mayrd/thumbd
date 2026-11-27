@@ -17,6 +17,7 @@ LABEL org.opencontainers.image.title="thumbd" \
 # media match without chmod gymnastics.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
+    libjemalloc2 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -31,7 +32,8 @@ USER node
 EXPOSE 8090
 ENV THUMBD_PORT=8090 \
     THUMBD_CACHE=/cache \
-    THUMBD_V4L2=h264_v4l2m2m
+    THUMBD_V4L2=h264_v4l2m2m \
+    UV_THREADPOOL_SIZE=16
 
 # Node 20 ships fetch — no wget/curl needed in the image
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s \
